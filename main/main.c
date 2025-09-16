@@ -5,7 +5,7 @@
 #include "mesh.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-#include <ds3231.h>
+// #include <ds3231.h>
 #include <string.h>
 #include "esp_timer.h"
 #include "driver/i2c.h"
@@ -21,11 +21,9 @@ static const char *TAG = "MAIN";
 
 #define GPIO_PIN 2
 
-#define TESTING_LIDAR false
-#define TESTING_RTC false
+#define TESTING_LIDAR true
+#define TESTING_RTC true
 #define LED 9
-
-i2c_dev_t dev;
 
 int starting_millis = 0;
 uint8_t starting_year = 0;
@@ -40,23 +38,16 @@ bool century;
 bool h12Flag;
 bool pmFlag;
 
-#define I2C_MASTER_SCL_IO           14                          /*!< GPIO number used for I2C master clock */
-#define I2C_MASTER_SDA_IO           21                          /*!< GPIO number used for I2C master data  */
+#define I2C_MASTER_SCL_IO           GPIO_NUM_14                          /*!< GPIO number used for I2C master clock */
+#define I2C_MASTER_SDA_IO           GPIO_NUM_21                          /*!< GPIO number used for I2C master data  */
 #define I2C_MASTER_NUM              I2C_NUM_0                   /*!< I2C port number for master dev */
-#define I2C_MASTER_FREQ_HZ          100000                      /*!< I2C master clock frequency */
+#define I2C_MASTER_FREQ_HZ          400000                      /*!< I2C master clock frequency */
 #define I2C_MASTER_TX_BUF_DISABLE   0                           /*!< I2C master doesn't need buffer */
 #define I2C_MASTER_RX_BUF_DISABLE   0                           /*!< I2C master doesn't need buffer */
 #define I2C_MASTER_TIMEOUT_MS       10000
 
-#define ES3231_SENSOR_ADDR         0x68        /*!< Address of the ES3231 sensor */
-#define ES3231_WRITE_REG_ADDR      0x75        /*!< Register addresses of the "who am I" register */
-#define ES3231_RESET_BIT           7
-
 static const char *TFMINI_TAG = "TFMINI_I2C";
 static const char *DS3231_TAG = "ds3231";
-
-i2c_master_dev_handle_t dev_handle;
-i2c_master_bus_handle_t bus_handle;
 
 int distance = 0;
 int strength = 0;
@@ -67,14 +58,18 @@ bool waiting = false;
 
 uint8_t general[16];
 
+i2c_master_dev_handle_t tfmini_dev_handle;
+i2c_master_bus_handle_t bus_handle;
 
 // Function Declarations
-static esp_err_t es3231_register_read(i2c_master_dev_handle_t dev_handle, uint8_t reg_addr, uint8_t *data, size_t len);
+static esp_err_t i2c_register_read(i2c_master_dev_handle_t dev_handle, uint8_t reg_addr, uint8_t *data, size_t len);
 static void i2c_master_init(i2c_master_bus_handle_t *bus_handle, i2c_master_dev_handle_t *dev_handle);
 void getTFminiData(int* distance, int* strength);
-void ds3231_read(void *pvParameters);
+void loop(void *pvParameters);
 void setup();
-void ds3231(void *pvParameters);
+
+// i2c_dev_t ds3231_dev;
+// i2c_dev_t tfmini_dev;
 
 void app_main(void)
 {
@@ -84,148 +79,178 @@ void app_main(void)
     // ESP_LOGI(TAG, "Initializing Mesh network...");
     // ESP_ERROR_CHECK(mesh_init());
     
-    ESP_ERROR_CHECK(i2cdev_init());
-    memset(&dev, 0, sizeof(i2c_dev_t));
-    i2c_master_init(&bus_handle, &dev_handle);
-    ESP_ERROR_CHECK(ds3231_init_desc(&dev, 1, I2C_MASTER_SDA_IO, I2C_MASTER_SCL_IO));
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << GPIO_PIN),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE
-    };
+    // ESP_ERROR_CHECK(i2cdev_init());
+    // ESP_ERROR_CHECK(ds3231_init_desc(&ds3231_dev, I2C_MASTER_NUM, I2C_MASTER_SDA_IO, I2C_MASTER_SCL_IO));
 
-    gpio_config(&io_conf);
-    // Instantiate I2C
+    i2c_master_init(&bus_handle, &tfmini_dev_handle);
+
+    // Manually initialize the TFMini device descriptor
+    // tfmini_dev.port = I2C_MASTER_NUM;
+    // tfmini_dev.addr = 0x10; // TFMini I2C address
+    // tfmini_dev.cfg.sda_io_num = I2C_MASTER_SDA_IO;
+    // tfmini_dev.cfg.scl_io_num = I2C_MASTER_SCL_IO;
+    // tfmini_dev.cfg.master.clk_speed = I2C_MASTER_FREQ_HZ;
+
+    // gpio_config_t io_conf = {
+    //     .pin_bit_mask = (1ULL << GPIO_PIN),
+    //     .mode = GPIO_MODE_OUTPUT,
+    //     .pull_up_en = GPIO_PULLUP_DISABLE,
+    //     .pull_down_en = GPIO_PULLDOWN_DISABLE,
+    //     .intr_type = GPIO_INTR_DISABLE
+    // };
+
+    // gpio_config(&io_conf);
+
     ESP_LOGI(TAG, "I2C initialized successfully");
 
-    setup();
+    // setup();
 
-    xTaskCreate(ds3231_read, "ds3231_read", 4192, NULL, 5, NULL);
+    xTaskCreate(loop, "main_loop", 4192, NULL, 5, NULL);
 }
 
-static esp_err_t es3231_register_read(i2c_master_dev_handle_t dev_handle, uint8_t reg_addr, uint8_t *data, size_t len)
+static esp_err_t i2c_register_read(i2c_master_dev_handle_t dev_handle, uint8_t reg_addr, uint8_t *data, size_t len)
 {
     return i2c_master_transmit_receive(dev_handle, &reg_addr, 1, data, len, I2C_MASTER_TIMEOUT_MS);
 }
 
-static void i2c_master_init(i2c_master_bus_handle_t *bus_handle, i2c_master_dev_handle_t *dev_handle)
+static esp_err_t i2c_register_write_byte(i2c_master_dev_handle_t dev_handle, uint8_t reg_addr, uint8_t data)
 {
-    i2c_master_bus_config_t bus_config = {
-        .i2c_port = I2C_MASTER_NUM,
-        .sda_io_num = I2C_MASTER_SDA_IO,
-        .scl_io_num = I2C_MASTER_SCL_IO,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
-    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, bus_handle));
+    uint8_t write_buf[2] = {reg_addr, data};
+    return i2c_master_transmit(dev_handle, write_buf, sizeof(write_buf), I2C_MASTER_TIMEOUT_MS);
+}
 
+void add_i2c_device(i2c_master_bus_handle_t *bus_handle, i2c_master_dev_handle_t *dev_handle, int device_address) {
     i2c_device_config_t dev_config = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = 0x1,
+        .device_address = device_address,
         .scl_speed_hz = I2C_MASTER_FREQ_HZ,
     };
     ESP_ERROR_CHECK(i2c_master_bus_add_device(*bus_handle, &dev_config, dev_handle));
 }
 
+static void i2c_master_init(i2c_master_bus_handle_t *bus_handle, i2c_master_dev_handle_t *dev_handle)
+{
+    i2c_master_bus_config_t bus_config = {
+        .i2c_port = -1, // using any available port
+        .sda_io_num = I2C_MASTER_SDA_IO,
+        .scl_io_num = I2C_MASTER_SCL_IO,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = false,
+    };
+    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, bus_handle));
+    add_i2c_device(bus_handle, dev_handle, 0x10); //TFMINI
+    add_i2c_device(bus_handle, dev_handle, 0b1101000); //D23231
+}
+
 void getTFminiData(int* distance, int* strength) {
-    static char i = 0;
-    int j = 0;
-    int checksum = 0; 
-    uint8_t rx[9];
-    ESP_ERROR_CHECK(es3231_register_read(dev_handle, 0x1, rx, 1));
-    if (rx[0] != 0x59) {
-        i = 0;
-    } else if (i == 1 && rx[1] != 0x59) {
-        i = 0;
-    } else if (i == 8) {
-        for (j = 0; j < 8; j++) {
-            checksum += rx[j];
-        }
-        if (rx[8] == (checksum % 256)) {
-            *distance = rx[2] + rx[3] * 256;
-            *strength = rx[4] + rx[5] * 256;
-        }
-    i = 0;
-    } else {
-        i++;
-    }  
-}
+    uint8_t command[] = {0x5A, 0x05, 0x00, 0x01, 0x60};
+    uint8_t rx_data[9];
+    esp_err_t err;
 
-void ds3231_read(void *pvParameters) {
-    bool sent;
-    getTFminiData(&distance, &strength);
-    if(distance != 65535){
-        if(distance < CENTIMETERS && (esp_timer_get_time() / 1000) - prevLED > LED_TIMEOUT){
-        gpio_set_level(GPIO_PIN, 0);
+    err = i2c_master_transmit(tfmini_dev_handle, command, sizeof(command), I2C_MASTER_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        ESP_LOGE(TFMINI_TAG, "Failed to send measurement command: %s", esp_err_to_name(err));
+        return;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(30)); 
+
+    err = i2c_master_receive(tfmini_dev_handle, rx_data, sizeof(rx_data), I2C_MASTER_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        ESP_LOGE(TFMINI_TAG, "Failed to read data from TFMini: %s", esp_err_to_name(err));
+        return;
+    }
+
+    if (rx_data[0] == 0x59 && rx_data[1] == 0x59) {
+        int checksum = 0;
+        for (int i = 0; i < 8; i++) {
+            checksum += rx_data[i];
+        }
+        
+        if (rx_data[8] == (checksum & 0xFF)) {
+            *distance = rx_data[2] | (rx_data[3] << 8);
+            *strength = rx_data[4] | (rx_data[5] << 8);
         } else {
-        gpio_set_level(GPIO_PIN, 1);
+            ESP_LOGW(TFMINI_TAG, "TFMini checksum error");
         }
-        if(!waiting && distance < CENTIMETERS){
-        start = (esp_timer_get_time() / 1000);
-        waiting = true;
-        sent = false;
-
-        general[0] = (uint8_t) 1; // Timing Gate ID
-        general[1] = (uint8_t) 0; // gate number (increment with each new gate)
-
-        general[2] = starting_second;
-        general[3] = starting_minute;
-        general[4] = starting_hour;
-        general[5] = starting_day;
-        general[6] = starting_month;
-        general[7] = starting_year;
-
-        general[8] = (starting_millis >> 24) & 0xff;
-        general[9] = (starting_millis >> 16) & 0xff;
-        general[10] = (starting_millis >> 8) & 0xff;
-        general[11] = starting_millis & 0xff; 
-
-        general[12] = (start >> 24) & 0xff;
-        general[13] = (start >> 16) & 0xff;
-        general[14] = (start >> 8) & 0xff;
-        general[15] = start & 0xff; 
-
-        } else if (waiting && (esp_timer_get_time() / 1000) - start > UPDATE_TIMEOUT){
-        waiting = false;
-        ESP_LOGI(DS3231_TAG, "ended timeout");
-        }
-        // SEND TO ROOT
-    }
-    if (TESTING_LIDAR){
-        printf("%dcm\tstrength: %d\tstart: %d\n", distance, strength, start);
-    }
-    if (TESTING_RTC){
-        printf("Starting Time Test:\t%d/%d/%d %d:%d:%d", starting_month, starting_day, starting_year, starting_hour, starting_minute, starting_second);
+    } else {
+        ESP_LOGW(TFMINI_TAG, "Invalid TFMini header received");
     }
 }
 
+void loop(void *pvParameters) {
+    while (1) {
+        bool sent;
+        getTFminiData(&distance, &strength);
+        if (distance != 65535) {
+            if (distance < CENTIMETERS && (esp_timer_get_time() / 1000) - prevLED > LED_TIMEOUT) {
+                // gpio_set_level(GPIO_PIN, 0);
+            } else {
+                // gpio_set_level(GPIO_PIN, 1);
+            }
+            if (!waiting && distance < CENTIMETERS) {
+                start = (esp_timer_get_time() / 1000);
+                waiting = true;
+                sent = false;
 
+                general[0] = (uint8_t)1; // Timing Gate ID
+                general[1] = (uint8_t)0; // gate number (increment with each new gate)
 
+                general[2] = starting_second;
+                general[3] = starting_minute;
+                general[4] = starting_hour;
+                general[5] = starting_day;
+                general[6] = starting_month;
+                general[7] = starting_year;
 
+                general[8] = (starting_millis >> 24) & 0xff;
+                general[9] = (starting_millis >> 16) & 0xff;
+                general[10] = (starting_millis >> 8) & 0xff;
+                general[11] = starting_millis & 0xff;
 
-void setup() {
-    ESP_LOGI("SETUP", "\n" __FILE__ " " __DATE__ " " __TIME__);
-    
-    gpio_set_level(13, 1);
-    time_t seconds=time(NULL);
-    struct tm* current_time=localtime(&seconds);
-    ds3231_set_time(&dev, current_time);
-    ESP_LOGI("SETUP", "UPDATED RTC");
-    
-    struct tm* now;
-    memset(&now, 0, sizeof(now)); 
-    ds3231_get_time(&dev, now);
-    // int start_sec = now->tm_sec;
-    // while(start_sec == myRTC.getSecond()); cringle??
-    
-    // starting_millis = esp_timer_get_time() / 1000;
-    // starting_year = now->tm_year;
-    // starting_month = now->tm_mon;
-    // starting_day = now->tm_mday;
-    // starting_hour = now->tm_hour;
-    // starting_minute = now->tm_min;
-    // starting_second = now->tm_sec;
+                general[12] = (start >> 24) & 0xff;
+                general[13] = (start >> 16) & 0xff;
+                general[14] = (start >> 8) & 0xff;
+                general[15] = start & 0xff;
+
+            } else if (waiting && (esp_timer_get_time() / 1000) - start > UPDATE_TIMEOUT) {
+                waiting = false;
+                ESP_LOGI(DS3231_TAG, "ended timeout");
+            }
+            // SEND TO ROOT
+        }
+        if (TESTING_LIDAR) {
+            printf("%dcm\tstrength: %d\tstart: %d\n", distance, strength, start);
+        }
+        if (TESTING_RTC) {
+            printf("Starting Time Test:\t%d/%d/%d %d:%d:%d\n", starting_month, starting_day, starting_year, starting_hour, starting_minute, starting_second);
+        }
+        vTaskDelay(pdMS_TO_TICKS(100)); 
+    }
 }
+
+// void setup() {
+//     ESP_LOGI("SETUP", "\n" __FILE__ " " __DATE__ " " __TIME__);
+    
+//     // gpio_set_level(GPIO_NUM_13, 1);
+//     time_t seconds=time(NULL);
+//     struct tm* current_time=localtime(&seconds);
+//     ds3231_set_time(&ds3231_dev, current_time);
+//     ESP_LOGI("SETUP", "UPDATED RTC");
+    
+//     struct tm now;
+//     memset(&now, 0, sizeof(struct tm));
+//     ds3231_get_time(&ds3231_dev, &now);
+
+//     // int start_sec = now.tm_sec;
+//     // while(start_sec == myRTC.getSecond());
+    
+//     starting_millis = esp_timer_get_time() / 1000;
+//     starting_year = now.tm_year;
+//     starting_month = now.tm_mon;
+//     starting_day = now.tm_mday;
+//     starting_hour = now.tm_hour;
+//     starting_minute = now.tm_min;
+//     starting_second = now.tm_sec;
+// }
