@@ -12,5 +12,7 @@
  * @return esp_err_t ESP_OK on success, otherwise an error code.
  */
 esp_err_t mesh_init(void);
+// Use this to send timestamp to root node
+void send_timestamp(int64_t timestamp);
 
 #endif

@@ -35,6 +35,7 @@ static TaskHandle_t send_task_handle = NULL;
  * Function Declarations
  *******************************************************/
 static void send_timestamp_task(void *pvParameters);
+void send_timestamp(int64_t timestamp);
 static void mesh_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data);
 static void ip_event_handler(void *arg, esp_event_base_t event_base,
@@ -62,6 +63,35 @@ static void send_timestamp_task(void *pvParameters)
         int64_t timestamp_us = esp_timer_get_time();
 
         int len = snprintf((char *)tx_buf, TX_SIZE, "timestamp: %lld us", timestamp_us);
+        data.size = len + 1;
+
+        err = esp_mesh_send(NULL, &data, MESH_DATA_P2P, NULL, 0); // NULL sends to parent
+        if (err == ESP_OK) {
+            ESP_LOGI(MESH_TAG, "Sent message to root: %s", tx_buf);
+        } else {
+            ESP_LOGE(MESH_TAG, "Failed to send message to root, err:0x%x", err);
+        }
+    }
+    vTaskDelete(NULL);
+}
+
+
+void send_timestamp(int64_t timestamp)
+{
+    esp_err_t err;
+    mesh_data_t data;
+    data.data = tx_buf;
+    data.proto = MESH_PROTO_BIN;
+    data.tos = MESH_TOS_P2P;
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(5000));
+
+        if (!is_mesh_connected || esp_mesh_is_root()) {
+            continue;
+        }
+
+        int len = snprintf((char *)tx_buf, TX_SIZE, "timestamp: %lld us", timestamp);
         data.size = len + 1;
 
         err = esp_mesh_send(NULL, &data, MESH_DATA_P2P, NULL, 0); // NULL sends to parent
