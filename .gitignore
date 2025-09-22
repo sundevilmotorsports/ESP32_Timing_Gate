@@ -5,3 +5,8 @@ sdkconfig.old
 managed_components/
 build/
 .vscode/
+CMakeCache.txt
+*.cmake
+*.bin
+*.exe
+/CMakeFiles
