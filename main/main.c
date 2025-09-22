@@ -25,6 +25,9 @@ static const char *TAG = "MAIN";
 #define RTC_ADDR                    0b1101000
 #define THRESHOLD 50
 
+#define DEBOUNCE_TIME 5
+#define DETECT 500
+
 static int state = 0;
 static long change_time = 0;
 static long last_activation = 0;
@@ -36,7 +39,7 @@ int debounce(int input) {
   if (input != state) {
     if (change_time == 0) {
       change_time = current_time;
-    } else if (current_time - change_time >= 500) {
+    } else if (current_time - change_time >= DEBOUNCE_TIME) {
       state = input;
       change_time = 0;      if (input == 1) {
         last_activation = current_time;
@@ -83,21 +86,29 @@ void app_main(void)
     uint16_t prevDist = 0;    // Send command to device
     espnow_data_t packet;
     int counter = 0;
-    int currentState = -1;
-    bool detect = false;
+    bool currentState = false;
+    bool prev = false;
     float epoch = 0;
     float diff = 0;
+    
+    // 90 Hz loop timing (11.11 ms period)
+    const TickType_t loop_period = pdMS_TO_TICKS(11);  // ~11.11 ms for 90 Hz
+    TickType_t last_wake_time = xTaskGetTickCount();
+    
     while(1) {
         prevDist = dist;
         dist = getTfData(); 
-        currentState = (abs(dist - prevDist) > THRESHOLD) ? 1 : 0;
-        if (currentState) {
-            detect = !detect;
-        }
+        // currentState = (abs(dist - prevDist) > THRESHOLD) ? 1 : 0;
+        // if (currentState) {
+        //     detect = !detect;
+        // }
+        prev = currentState;
+        currentState = debounce(dist < DETECT);
+        printf("Distance: %u\n", dist);
 
-        if (debounce(dist < 50)) {
+        if (!prev && currentState) {
             packet.seq_num = counter;
-            float current = esp_timer_get_time() / 1e6;  // seconds
+            float current = (esp_timer_get_time() / 1e6) - (float)DEBOUNCE_TIME / 1e3;  // seconds
             diff = current - epoch;
             epoch = current;
             
@@ -110,6 +121,9 @@ void app_main(void)
             espnow_send_once(&packet);
             vTaskDelay(pdMS_TO_TICKS(200)); 
         }
+        
+        // Maintain 90 Hz loop rate
+        vTaskDelayUntil(&last_wake_time, loop_period);
     }
 
 }
