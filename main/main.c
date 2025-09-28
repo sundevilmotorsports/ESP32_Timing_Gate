@@ -105,6 +105,11 @@ static uint8_t bcd2dec(uint8_t val) {
     return (val >> 4) * 10 + (val & 0x0F);
 }
 
+static uint8_t dec2bcd(uint8_t val)
+{
+    return ((val / 10) << 4) + (val % 10);
+}
+
 // --- Read seconds from DS3231 ---
 static esp_err_t ds3231_get_time(uint8_t *hours, uint8_t *minutes, uint8_t *seconds) {
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
@@ -145,6 +150,33 @@ int64_t get_synced_micros(void) {
     int64_t now_us = esp_timer_get_time();
     int64_t delta_us = now_us - last_sync_us;
     return rtc_seconds * 1000000 + delta_us;
+}
+
+esp_err_t ds3231_set_time(struct tm *time) {
+    uint8_t data[7];
+
+    data[0] = dec2bcd(time->tm_sec);
+    data[1] = dec2bcd(time->tm_min);
+    data[2] = dec2bcd(time->tm_hour);
+
+    /* The week data must be in the range 1 to 7, and to keep the start on the
+     * same day as for tm_wday have it start at 1 on Sunday. */
+    data[3] = dec2bcd(time->tm_wday + 1);
+    data[4] = dec2bcd(time->tm_mday);
+    data[5] = dec2bcd(time->tm_mon + 1);
+    data[6] = dec2bcd(time->tm_year - 100);
+
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (RTC_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, RTC_REG_SECONDS, true);
+    i2c_master_write(cmd, data, 7, true);
+
+    i2c_master_stop(cmd);
+    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 1000 / portTICK_PERIOD_MS);
+    i2c_cmd_link_delete(cmd);
+
+    return ret;
 }
 
 void app_main(void)
@@ -230,7 +262,3 @@ void app_main(void)
     }
 
 }
-
-
-
-
