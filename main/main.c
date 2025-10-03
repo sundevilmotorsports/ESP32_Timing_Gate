@@ -30,6 +30,10 @@ static const char *TAG = "MAIN";
 #define DEBOUNCE_TIME 5
 #define DETECT 50
 
+#define UART_PORT UART_NUM_0
+#define UART_BUF_SIZE 1024
+#define RD_BUF_SIZE 128
+
 #define SQW_GPIO GPIO_NUM_12
 static int state = 0;
 static long change_time = 0;
@@ -37,6 +41,8 @@ static long last_activation = 0;
 
 static volatile int64_t last_sync_us = 0;   // Last sync timestamp (µs)
 static volatile int64_t rtc_seconds = 0;    // DS3231 absolute time in seconds
+
+static QueueHandle_t uart_event_queue = NULL;
 
 long get_time_ms() { return clock() * 1000 / CLOCKS_PER_SEC; }
 
@@ -105,6 +111,11 @@ static uint8_t bcd2dec(uint8_t val) {
     return (val >> 4) * 10 + (val & 0x0F);
 }
 
+static uint8_t dec2bcd(uint8_t val)
+{
+    return ((val / 10) << 4) + (val % 10);
+}
+
 // --- Read seconds from DS3231 ---
 static esp_err_t ds3231_get_time(uint8_t *hours, uint8_t *minutes, uint8_t *seconds) {
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
@@ -147,6 +158,49 @@ int64_t get_synced_micros(void) {
     return rtc_seconds * 1000000 + delta_us;
 }
 
+esp_err_t ds3231_set_time(struct tm *time) {
+    uint8_t data[7];
+
+    data[0] = dec2bcd(time->tm_sec);
+    data[1] = dec2bcd(time->tm_min);
+    data[2] = dec2bcd(time->tm_hour);
+
+    /* The week data must be in the range 1 to 7, and to keep the start on the
+     * same day as for tm_wday have it start at 1 on Sunday. */
+    data[3] = dec2bcd(time->tm_wday + 1);
+    data[4] = dec2bcd(time->tm_mday);
+    data[5] = dec2bcd(time->tm_mon + 1);
+    data[6] = dec2bcd(time->tm_year - 100);
+
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (RTC_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, RTC_REG_SECONDS, true);
+    i2c_master_write(cmd, data, 7, true);
+
+    i2c_master_stop(cmd);
+    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 1000 / portTICK_PERIOD_MS);
+    i2c_cmd_link_delete(cmd);
+
+    return ret;
+}
+
+static void uart_init(void){
+    const uart_config_t uart_config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+    };
+
+    uart_driver_install(UART_PORT, UART_BUF_SIZE * 2, 0, 20, &uart_event_queue, 0);
+    uart_param_config(UART_PORT, &uart_config);
+    uart_set_pin(UART_PORT, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+
+    ESP_LOGI(TAG, "UART initialized successfully");
+}
+
 void app_main(void)
 {
     // Initialize NVS
@@ -172,7 +226,76 @@ void app_main(void)
     i2c_param_config(I2C_MASTER_NUM, &conf);
     i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
     vTaskDelay(1000 / portTICK_PERIOD_MS);
-    // esp_restart();
+
+    uart_init();
+
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+
+    ESP_LOGI(TAG, "Waiting for rtc sync");
+
+    uint8_t data[128];
+    int total_len = 0;
+    int64_t start_time = esp_timer_get_time();
+    const int64_t timeout_us = 10 * 1e6;
+
+    while (total_len < sizeof(data) - 1) {
+        int len = uart_read_bytes(UART_NUM_0, &data[total_len], 1, 100 / portTICK_PERIOD_MS);
+
+        if (len > 0) {
+            total_len += len;
+            if (data[total_len - 1] == '\n' || data[total_len - 1] == '\r' || data[total_len - 1] == '\0') {
+                break;
+            }
+        }
+
+        if (esp_timer_get_time() - start_time > timeout_us) {
+            ESP_LOGI(TAG, "No timestamp received");
+            break;
+        }
+    }
+
+    if (total_len > 0) {
+        data[total_len] = '\0';
+        // printf("Received: %.*s\n", total_len, data);
+
+        if (total_len >= 6) {
+            char hour_str[3] = {data[0], data[1], '\0'};
+            char min_str[3] = {data[2], data[3], '\0'};
+            char sec_str[3] = {data[4], data[5], '\0'};
+
+            int hours = atoi(hour_str);
+            int minutes = atoi(min_str);
+            int seconds = atoi(sec_str);
+
+            if (hours >= 0 && hours <= 23 && minutes >= 0 && minutes <= 59 && seconds >= 0 && seconds <= 59) {
+                struct tm time;
+                time.tm_hour = hours;
+                time.tm_min = minutes;
+                time.tm_sec = seconds;
+                // Not needed
+                time.tm_wday = 0;
+                time.tm_mday = 0;
+                time.tm_mon = 0;
+                time.tm_year = 125;
+
+                esp_err_t ret = ds3231_set_time(&time);
+                if (ret == ESP_OK) {
+                    ESP_LOGI(TAG, "Time set successfully to %02d:%02d:%02d", hours, minutes, seconds);
+                } else {
+                    ESP_LOGE(TAG, "Failed to set time");
+                }
+            } else {
+                ESP_LOGE(TAG, "Invalid time values: %02d:%02d:%02d", hours, minutes, seconds);
+            }
+        } else {
+            ESP_LOGE(TAG, "Invalid timestamp format. Expected HHMMSS, got %d characters", total_len);
+        }
+    } else {
+        ESP_LOGI(TAG, "No timestamp received");
+    }
+
+    uart_driver_delete(UART_NUM_0);
+
     uint16_t dist = 0;
     uint16_t prevDist = 0;    // Send command to device
     espnow_data_t packet;
@@ -230,7 +353,3 @@ void app_main(void)
     }
 
 }
-
-
-
-
