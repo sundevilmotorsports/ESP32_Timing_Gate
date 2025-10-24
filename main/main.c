@@ -5,7 +5,6 @@
 #include "mesh.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-// #include <ds3231.h>
 #include <string.h>
 #include "esp_timer.h"
 #include "driver/i2c.h"
@@ -151,12 +150,24 @@ static void IRAM_ATTR sqw_handler(void* arg) {
     }
 }
 
+static portMUX_TYPE rtc_sync_mux = portMUX_INITIALIZER_UNLOCKED;
 // --- Get synced microseconds ---
 int64_t get_synced_micros(void) {
+    portENTER_CRITICAL(&rtc_sync_mux);
+    int64_t base_rtc_seconds = rtc_seconds;
+    int64_t last_sync = last_sync_us;
+    portEXIT_CRITICAL(&rtc_sync_mux);
     int64_t now_us = esp_timer_get_time();
-    int64_t delta_us = now_us - last_sync_us;
+    int64_t delta_us = now_us - last_sync;
     return rtc_seconds * 1000000 + delta_us;
 }
+
+// // --- Get synced microseconds ---
+// int64_t get_synced_micros(void) {
+//     int64_t now_us = esp_timer_get_time();
+//     int64_t delta_us = now_us - last_sync_us;
+//     return rtc_seconds * 1000000 + delta_us;
+// }
 
 esp_err_t ds3231_set_time(struct tm *time) {
     uint8_t data[7];
@@ -210,146 +221,205 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK( ret );
-    
-    wifi_init();
-    espnow_init();
 
-    uint8_t buf[7];
-    i2c_config_t conf = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = I2C_MASTER_SDA_IO,
-        .scl_io_num = I2C_MASTER_SCL_IO,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = I2C_MASTER_FREQ_HZ,
-    };
-    i2c_param_config(I2C_MASTER_NUM, &conf);
-    i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
+    #if CONFIG_USE_MESH_NETWORK
+        mesh_init();
+    #else
+        wifi_init();
+        espnow_init();
+    #endif
 
-    uart_init();
+    #if CONFIG_USE_REAL_DATA
+        uint8_t buf[7];
+        i2c_config_t conf = {
+            .mode = I2C_MODE_MASTER,
+            .sda_io_num = I2C_MASTER_SDA_IO,
+            .scl_io_num = I2C_MASTER_SCL_IO,
+            .sda_pullup_en = GPIO_PULLUP_ENABLE,
+            .scl_pullup_en = GPIO_PULLUP_ENABLE,
+            .master.clk_speed = I2C_MASTER_FREQ_HZ,
+        };
+        i2c_param_config(I2C_MASTER_NUM, &conf);
+        i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
 
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
+        uart_init();
 
-    ESP_LOGI(TAG, "Waiting for rtc sync");
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
 
-    uint8_t data[128];
-    int total_len = 0;
-    int64_t start_time = esp_timer_get_time();
-    const int64_t timeout_us = 10 * 1e6;
+        ESP_LOGI(TAG, "Waiting for rtc sync");
 
-    while (total_len < sizeof(data) - 1) {
-        int len = uart_read_bytes(UART_NUM_0, &data[total_len], 1, 100 / portTICK_PERIOD_MS);
+        uint8_t data[128];
+        int total_len = 0;
+        int64_t start_time = esp_timer_get_time();
+        const int64_t timeout_us = 10 * 1e6;
 
-        if (len > 0) {
-            total_len += len;
-            if (data[total_len - 1] == '\n' || data[total_len - 1] == '\r' || data[total_len - 1] == '\0') {
+        while (total_len < sizeof(data) - 1) {
+            int len = uart_read_bytes(UART_NUM_0, &data[total_len], 1, 100 / portTICK_PERIOD_MS);
+
+            if (len > 0) {
+                total_len += len;
+                if (data[total_len - 1] == '\n' || data[total_len - 1] == '\r' || data[total_len - 1] == '\0') {
+                    break;
+                }
+            }
+
+            if (esp_timer_get_time() - start_time > timeout_us) {
+                ESP_LOGI(TAG, "No timestamp received");
                 break;
             }
         }
 
-        if (esp_timer_get_time() - start_time > timeout_us) {
-            ESP_LOGI(TAG, "No timestamp received");
-            break;
-        }
-    }
+        if (total_len > 0) {
+            data[total_len] = '\0';
+            // printf("Received: %.*s\n", total_len, data);
 
-    if (total_len > 0) {
-        data[total_len] = '\0';
-        // printf("Received: %.*s\n", total_len, data);
+            if (total_len >= 6) {
+                char hour_str[3] = {data[0], data[1], '\0'};
+                char min_str[3] = {data[2], data[3], '\0'};
+                char sec_str[3] = {data[4], data[5], '\0'};
 
-        if (total_len >= 6) {
-            char hour_str[3] = {data[0], data[1], '\0'};
-            char min_str[3] = {data[2], data[3], '\0'};
-            char sec_str[3] = {data[4], data[5], '\0'};
+                int hours = atoi(hour_str);
+                int minutes = atoi(min_str);
+                int seconds = atoi(sec_str);
 
-            int hours = atoi(hour_str);
-            int minutes = atoi(min_str);
-            int seconds = atoi(sec_str);
+                if (hours >= 0 && hours <= 23 && minutes >= 0 && minutes <= 59 && seconds >= 0 && seconds <= 59) {
+                    struct tm time;
+                    time.tm_hour = hours;
+                    time.tm_min = minutes;
+                    time.tm_sec = seconds;
+                    // Not needed
+                    time.tm_wday = 0;
+                    time.tm_mday = 0;
+                    time.tm_mon = 0;
+                    time.tm_year = 125;
 
-            if (hours >= 0 && hours <= 23 && minutes >= 0 && minutes <= 59 && seconds >= 0 && seconds <= 59) {
-                struct tm time;
-                time.tm_hour = hours;
-                time.tm_min = minutes;
-                time.tm_sec = seconds;
-                // Not needed
-                time.tm_wday = 0;
-                time.tm_mday = 0;
-                time.tm_mon = 0;
-                time.tm_year = 125;
-
-                esp_err_t ret = ds3231_set_time(&time);
-                if (ret == ESP_OK) {
-                    ESP_LOGI(TAG, "Time set successfully to %02d:%02d:%02d", hours, minutes, seconds);
+                    esp_err_t ret = ds3231_set_time(&time);
+                    if (ret == ESP_OK) {
+                        ESP_LOGI(TAG, "Time set successfully to %02d:%02d:%02d", hours, minutes, seconds);
+                    } else {
+                        ESP_LOGE(TAG, "Failed to set time");
+                    }
                 } else {
-                    ESP_LOGE(TAG, "Failed to set time");
+                    ESP_LOGE(TAG, "Invalid time values: %02d:%02d:%02d", hours, minutes, seconds);
                 }
             } else {
-                ESP_LOGE(TAG, "Invalid time values: %02d:%02d:%02d", hours, minutes, seconds);
+                ESP_LOGE(TAG, "Invalid timestamp format. Expected HHMMSS, got %d characters", total_len);
             }
         } else {
-            ESP_LOGE(TAG, "Invalid timestamp format. Expected HHMMSS, got %d characters", total_len);
+            ESP_LOGI(TAG, "No timestamp received");
         }
-    } else {
-        ESP_LOGI(TAG, "No timestamp received");
-    }
 
-    uart_driver_delete(UART_NUM_0);
+        uart_driver_delete(UART_NUM_0);
 
-    uint16_t dist = 0;
-    uint16_t prevDist = 0;    // Send command to device
-    espnow_data_t packet;
-    int counter = 0;
-    bool currentState = false;
-    bool prev = false;
-    float epoch = 0;
-    float diff = 0;
+        uint16_t dist = 0;
+        uint16_t prevDist = 0;    // Send command to device
+        #if CONFIG_USE_MESH_NETWORK
+            mesh_packet_t packet;
+        #else
+            espnow_data_t packet;
+        #endif
+        int counter = 0;
+        bool currentState = false;
+        bool prev = false;
+        float epoch = 0;
+        float diff = 0;
 
-    
-    // SQW input pin
-    gpio_config_t io_conf = {
-        .intr_type = GPIO_INTR_POSEDGE,
-        .mode = GPIO_MODE_INPUT,
-        .pin_bit_mask = 1ULL << SQW_GPIO,
-        .pull_up_en = 1,
-    };
-    gpio_config(&io_conf);
-    gpio_install_isr_service(0);
-    gpio_isr_handler_add(SQW_GPIO, sqw_handler, NULL);
-    
-    // 90 Hz loop timing (11.11 ms period)
-    const TickType_t loop_period = pdMS_TO_TICKS(11);  // ~11.11 ms for 90 Hz
-    TickType_t last_wake_time = xTaskGetTickCount();
-    
-    while(1) {
-        prevDist = dist;
-        dist = getTfData(); 
-        // currentState = (abs(dist - prevDist) > THRESHOLD) ? 1 : 0;
-        // if (currentState) {
-        //     detect = !detect;
-        // }
-        prev = currentState;
-        currentState = debounce(dist < DETECT);
-        printf("Time Delta: %f\n", (float)(get_synced_micros() / 1e6) - (float)(esp_timer_get_time() / 1e6));
+        
+        // SQW input pin
+        gpio_config_t io_conf = {
+            .intr_type = GPIO_INTR_POSEDGE,
+            .mode = GPIO_MODE_INPUT,
+            .pin_bit_mask = 1ULL << SQW_GPIO,
+            .pull_up_en = 1,
+        };
+        gpio_config(&io_conf);
+        gpio_install_isr_service(0);
+        gpio_isr_handler_add(SQW_GPIO, sqw_handler, NULL);
+        
+        // 90 Hz loop timing (11.11 ms period)
+        const TickType_t loop_period = pdMS_TO_TICKS(11);  // ~11.11 ms for 90 Hz
+        TickType_t last_wake_time = xTaskGetTickCount();
+        
+        while(1) {
+            prevDist = dist;
+            dist = getTfData(); 
+            // currentState = (abs(dist - prevDist) > THRESHOLD) ? 1 : 0;
+            // if (currentState) {
+            //     detect = !detect;
+            // }
+            prev = currentState;
+            currentState = debounce(dist < DETECT);
+            // printf("Time Delta: %f\n", (float)(get_synced_micros() / 1e6) - (float)(esp_timer_get_time() / 1e6));
+            
+            if (!prev && currentState) {
+                packet.seq_num = counter;
+                float current = (get_synced_micros() / 1e6) - (float)DEBOUNCE_TIME / 1e3;  // seconds
+                diff = current - epoch;
+                epoch = current;
 
-        if (!prev && currentState) {
-            packet.seq_num = counter;
+                int data_len = snprintf((char*)packet.data, sizeof(packet.data), "Lap Timer sent time: %f", diff);
+                packet.len = data_len;
+
+                packet.crc = 0;
+                #if CONFIG_USE_MESH_NETWORK
+                    packet.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)&packet, sizeof(mesh_packet_t));
+                #else
+                    packet.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)&packet, sizeof(espnow_data_t));
+                #endif
+                
+                ESP_LOGI(TAG, "Sending message #%d with time difference: %f sec", counter, diff);
+                #if CONFIG_USE_MESH_NETWORK
+                    mesh_send_once(&packet);
+                #else
+                    espnow_send_once(&packet);
+                #endif
+                counter++;
+
+                vTaskDelay(pdMS_TO_TICKS(200)); 
+            }
+            
+            // Maintain 90 Hz loop rate
+            vTaskDelayUntil(&last_wake_time, loop_period);
+        }
+        // THIS CODE IS NOT TESTED, USE WITH CAUTION
+    #elif CONFIG_USE_FAKE_DATA
+        #if CONFIG_USE_MESH_NETWORK
+            mesh_packet_t packet;
+        #else
+            espnow_data_t packet;
+        #endif
+        int counter = 0;
+        bool currentState = false;
+        bool prev = false;
+        float epoch = 0;
+        float diff = 0;
+
+        while(1) {
+            vTaskDelay(pdMS_TO_TICKS(rand() % (5000 + 1))); // Create random time between 0 and 5000ms
             float current = (get_synced_micros() / 1e6) - (float)DEBOUNCE_TIME / 1e3;  // seconds
             diff = current - epoch;
             epoch = current;
-            
-            snprintf(packet.text, sizeof(packet.text), "Lap Timer sent time: %f", diff);
+
+            int data_len = snprintf((char*)packet.data, sizeof(packet.data), "Lap Timer sent time: %f", diff);
+            packet.len = data_len;
 
             packet.crc = 0;
-            packet.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)&packet, sizeof(espnow_data_t));
-            
-            ESP_LOGI(TAG, "Sending message #%d...", counter);
-            espnow_send_once(&packet);
-            vTaskDelay(pdMS_TO_TICKS(200)); 
+            #if CONFIG_USE_MESH_NETWORK
+                packet.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)&packet, sizeof(mesh_packet_t));
+            #else
+                packet.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)&packet, sizeof(espnow_data_t));
+            #endif
+            packet.seq_num = counter;
+
+            ESP_LOGI(TAG, "Sending message #%d with time difference: %f sec", counter, diff);
+            #if CONFIG_USE_MESH_NETWORK
+                mesh_send_once(&packet);
+            #else
+                espnow_send_once(&packet);
+            #endif 
+            counter++;
         }
-        
-        // Maintain 90 Hz loop rate
-        vTaskDelayUntil(&last_wake_time, loop_period);
-    }
+    #endif
 
 }

@@ -3,6 +3,13 @@
 
 #include "esp_err.h"
 
+typedef struct {
+    uint16_t seq_num;
+    uint8_t data[30];
+    uint16_t crc;
+    size_t len;
+} mesh_packet_t;
+
 /**
  * @brief Initializes and starts the ESP-MESH network.
  *
@@ -13,6 +20,6 @@
  */
 esp_err_t mesh_init(void);
 // Use this to send timestamp to root node
-void send_timestamp(int64_t timestamp);
+void mesh_send_once(const mesh_packet_t *packet);
 
 #endif

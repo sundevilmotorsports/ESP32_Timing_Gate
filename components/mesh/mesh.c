@@ -9,6 +9,7 @@
 #include "nvs_flash.h"
 #include "esp_timer.h"
 #include "mesh.h"
+#include "lwip/sockets.h"
 
 /*******************************************************
  * Macros and Constants
@@ -21,19 +22,23 @@
  *******************************************************/
 static const char *MESH_TAG = "MESH_NETWORK";
 static const char *ROOT_TAG = "ROOT_TOGGLE";
+static const char *TCP_TAG = "TCP";
 
 static const uint8_t MESH_ID[6] = { 0x77, 0x77, 0x77, 0x77, 0x77, 0x77};
 static uint8_t tx_buf[TX_SIZE] = { 0, };
 static uint8_t rx_buf[RX_SIZE] = { 0, };
 static bool is_mesh_connected = false;
+static bool is_running = true;
 static mesh_addr_t mesh_parent_addr;
 static int mesh_layer = -1;
 static esp_netif_t *netif_sta = NULL;
-static TaskHandle_t send_task_handle = NULL;
+static QueueHandle_t tcp_tx_queue;
+static TaskHandle_t tcp_task_handle = NULL;
 
 /*******************************************************
  * Function Declarations
  *******************************************************/
+void esp_mesh_p2p_rx_main(void *arg);
 static void send_timestamp_task(void *pvParameters);
 void send_timestamp(int64_t timestamp);
 static void mesh_event_handler(void *arg, esp_event_base_t event_base,
@@ -45,6 +50,38 @@ static void root_toggle(void *pvParameters);
 /*******************************************************
  * Function Definitions
  *******************************************************/
+
+void esp_mesh_p2p_rx_main(void *arg) {
+    esp_err_t err;
+    mesh_addr_t from;
+    int flag = 0;
+    mesh_data_t data;
+    data.data = rx_buf;
+    data.size = RX_SIZE;
+    is_running = true;
+
+    while (is_running) {
+        data.size = RX_SIZE;
+        err = esp_mesh_recv(&from, &data, portMAX_DELAY, &flag, NULL, 0);
+        if (err != ESP_OK || !data.size) {
+            ESP_LOGE(MESH_TAG, "err:0x%x, size:%d", err, data.size);
+            continue;
+        }
+        ESP_LOGI(MESH_TAG, "Received message of size %d from "MACSTR, data.size, MAC2STR(from.addr));
+        ESP_LOGI(MESH_TAG, "Content: %.*s", data.size, data.data);
+
+        if (esp_mesh_is_root() && tcp_task_handle != NULL) { // if is root, then add to queue to send to AP
+            mesh_packet_t msg_to_queue;
+            memcpy(msg_to_queue.data, data.data, data.size);
+            msg_to_queue.len = data.size;
+
+            if (xQueueSend(tcp_tx_queue, &msg_to_queue, pdMS_TO_TICKS(100)) != pdPASS) {
+                ESP_LOGE(MESH_TAG, "Failed to send to TCP queue. Queue might be full.");
+            }
+        }
+    }
+    vTaskDelete(NULL);
+}
 
 static void send_timestamp_task(void *pvParameters)
 {
@@ -75,31 +112,87 @@ static void send_timestamp_task(void *pvParameters)
     vTaskDelete(NULL);
 }
 
-
-void send_timestamp(int64_t timestamp)
+void mesh_send_once(const mesh_packet_t *packet)
 {
+    if (!is_mesh_connected) {
+        return;
+    }
+    if (esp_mesh_is_root() && tcp_task_handle != NULL) { // if root, don't send through network, add to queue to send to AP
+        mesh_packet_t msg_to_queue;
+        memcpy(msg_to_queue.data, packet->data, packet->len);
+        msg_to_queue.len = packet->len;
+        if (xQueueSend(tcp_tx_queue, &msg_to_queue, pdMS_TO_TICKS(100)) != pdPASS) {
+                ESP_LOGE(MESH_TAG, "Failed to send to TCP queue. Queue might be full.");
+        }
+        return;
+    }
     esp_err_t err;
-    mesh_data_t data;
-    data.data = tx_buf;
-    data.proto = MESH_PROTO_BIN;
-    data.tos = MESH_TOS_P2P;
+    mesh_data_t mesh_data;
+    mesh_data.data = (const uint8_t *)packet->data;
+    mesh_data.size = packet->len;
+    mesh_data.proto = MESH_PROTO_BIN;
+    mesh_data.tos = MESH_TOS_P2P;
 
-    for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(5000));
+    err = esp_mesh_send(NULL, &mesh_data, MESH_DATA_P2P, NULL, 0); // NULL sends to parent
+    if (err == ESP_OK) {
+        ESP_LOGI(MESH_TAG, "Sent message to root: %s", tx_buf);
+    } else {
+        ESP_LOGE(MESH_TAG, "Failed to send message to root, err:0x%x", err);
+    }
+}
 
-        if (!is_mesh_connected || esp_mesh_is_root()) {
+void tcp_client_task(void *pvParameters)
+{
+    char host_ip[] = CONFIG_SOFTAP_SERVER_IP;
+    int addr_family = AF_INET;
+    int ip_protocol = IPPROTO_IP;
+    
+    ESP_LOGI(TCP_TAG, "TCP client task started.");
+
+    mesh_packet_t recv_packet;
+
+    while (1) {
+        struct sockaddr_in dest_addr;
+        dest_addr.sin_addr.s_addr = inet_addr(host_ip);
+        dest_addr.sin_family = AF_INET;
+        dest_addr.sin_port = htons(CONFIG_SOFTAP_SERVER_PORT);
+
+        int sock = socket(addr_family, SOCK_STREAM, ip_protocol);
+        if (sock < 0) {
+            ESP_LOGE(TCP_TAG, "Unable to create socket: errno %d", errno);
+            vTaskDelay(pdMS_TO_TICKS(1000)); // Wait before retrying
             continue;
         }
+        ESP_LOGI(TCP_TAG, "Socket created, connecting to %s:%d", host_ip, CONFIG_SOFTAP_SERVER_PORT);
 
-        int len = snprintf((char *)tx_buf, TX_SIZE, "timestamp: %lld us", timestamp);
-        data.size = len + 1;
-
-        err = esp_mesh_send(NULL, &data, MESH_DATA_P2P, NULL, 0); // NULL sends to parent
-        if (err == ESP_OK) {
-            ESP_LOGI(MESH_TAG, "Sent message to root: %s", tx_buf);
-        } else {
-            ESP_LOGE(MESH_TAG, "Failed to send message to root, err:0x%x", err);
+        int err = connect(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+        if (err != 0) {
+            ESP_LOGE(TCP_TAG, "Socket unable to connect: errno %d. Closing socket.", errno);
+            close(sock);
+            vTaskDelay(pdMS_TO_TICKS(4000)); // Wait longer before retrying connection
+            continue;
         }
+        ESP_LOGI(TCP_TAG, "Successfully connected");
+
+        // This inner loop handles sending and receiving data on the established connection
+        while (1) {
+            if (xQueueReceive(tcp_tx_queue, &recv_packet, pdMS_TO_TICKS(100))) {
+                int err = send(sock, recv_packet.data, recv_packet.len, 0);
+                if (err < 0) {
+                    ESP_LOGE(TCP_TAG, "Error occurred during sending: errno %d. Breaking from inner loop.", errno);
+                    break;
+                }
+                // ESP_LOGI(TCP_TAG, "Payload sent successfully.");
+            }
+            // Delay for a while before sending the next message
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+
+        // If we break from the inner loop, it means the connection is lost.
+        ESP_LOGE(TCP_TAG, "Shutting down socket and restarting...");
+        shutdown(sock, 0);
+        close(sock);
+        vTaskDelay(pdMS_TO_TICKS(1000)); // Wait a bit before trying to reconnect
     }
     vTaskDelete(NULL);
 }
@@ -187,10 +280,6 @@ static void mesh_event_handler(void *arg, esp_event_base_t event_base,
         if (esp_mesh_is_root()) {
             esp_netif_dhcpc_stop(netif_sta);
             esp_netif_dhcpc_start(netif_sta);
-        }
-        // Only want to do this after we connect to the parent
-        if (send_task_handle == NULL) {
-            xTaskCreate(send_timestamp_task, "SEND_TS_TASK", 3072, NULL, 5, &send_task_handle);
         }
     }
     break;
@@ -322,6 +411,15 @@ static void ip_event_handler(void *arg, esp_event_base_t event_base,
 {
     ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
     ESP_LOGI(MESH_TAG, "<IP_EVENT_STA_GOT_IP>IP:" IPSTR, IP2STR(&event->ip_info.ip));
+    if (esp_mesh_is_root() && tcp_task_handle == NULL) {
+        ESP_LOGI(TCP_TAG, "Device is ROOT and got IP. Starting TCP client task.");
+        xTaskCreate(tcp_client_task, "TCP_Client", 4096, NULL, 2, &tcp_task_handle);
+    } 
+    else if (!esp_mesh_is_root() && tcp_task_handle != NULL) {
+        ESP_LOGI(TCP_TAG, "Device is NO LONGER ROOT. Stopping TCP client task.");
+        vTaskDelete(tcp_task_handle);
+        tcp_task_handle = NULL;
+    }
 }
 
 esp_err_t mesh_init(void)
@@ -369,7 +467,7 @@ esp_err_t mesh_init(void)
     cfg.router.ssid_len = strlen(CONFIG_MESH_ROUTER_SSID);
     memcpy((uint8_t *) &cfg.router.ssid, CONFIG_MESH_ROUTER_SSID, cfg.router.ssid_len);
     memcpy((uint8_t *) &cfg.router.password, CONFIG_MESH_ROUTER_PASSWD,
-           strlen(CONFIG_MESH_ROUTER_PASSWD));
+        strlen(CONFIG_MESH_ROUTER_PASSWD));
     /* mesh softAP */
     ESP_ERROR_CHECK(esp_mesh_set_ap_authmode(CONFIG_MESH_AP_AUTHMODE));
     cfg.mesh_ap.max_connection = CONFIG_MESH_AP_CONNECTIONS;
@@ -389,8 +487,13 @@ esp_err_t mesh_init(void)
              esp_mesh_is_root_fixed() ? "root fixed" : "root not fixed",
              esp_mesh_get_topology(), esp_mesh_get_topology() ? "(chain)":"(tree)", esp_mesh_is_ps_enabled());
     
-    // If you need the root_toggle task, you can start it here:
-    // xTaskCreate(root_toggle, "TOG", 3072, NULL, 2, NULL);
+    tcp_tx_queue = xQueueCreate(100, sizeof(mesh_packet_t));
+    if (tcp_tx_queue == NULL) {
+        ESP_LOGE(MESH_TAG, "Failed to create TCP TX queue!");
+        return ESP_FAIL; 
+    }
+    
+    xTaskCreate(esp_mesh_p2p_rx_main, "Mesh Receive", 4332, NULL, 2, NULL);
 
     return ESP_OK;
 }

@@ -28,8 +28,9 @@
 
 typedef struct __attribute__((packed)) {
     uint16_t seq_num;   // Sequence number to keep track of messages
-    char text[30];         // Message content
+    uint8_t data[30];   // Message content
     uint16_t crc;       // CRC checksum for data integrity
+    size_t len;
 } espnow_data_t;
 
 

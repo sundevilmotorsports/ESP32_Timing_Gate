@@ -1,4 +1,4 @@
-menu "Example Configuration"
+menu "Mesh Configuration"
 
     choice
         bool "Mesh Topology"
@@ -106,6 +106,16 @@ menu "Example Configuration"
         help
             mesh network channel.
 
+    config MESH_NODE_IS_ROOT
+        bool "Designate this node as the Mesh Root"
+        default n
+        help
+            Select this to configure the device as the root node. The root connects
+            to an external Wi-Fi router to provide WAN access for the entire mesh.
+            If not selected, the device will act as a child node.
+            CURRENTLY NOT WORKING
+
+    # if MESH_NODE_IS_ROOT
     config MESH_ROUTER_SSID
         string "Router SSID"
         default "myssid"
@@ -117,18 +127,7 @@ menu "Example Configuration"
         default "mypassword"
         help
             Router password.
-
-    config SOFTAP_SERVER_IP
-        string "SoftAP Server IP Address"
-        default "192.168.4.1"
-        help
-            The IP address of the TCP server running on the SoftAP ESP32.
-
-    config SOFTAP_SERVER_PORT
-        int "SoftAP Server Port"
-        default 3333
-        help
-            The port number for the TCP server on the SoftAP ESP32.
+    # endif
 
     choice
         bool "Mesh AP Authentication Mode"
@@ -145,6 +144,18 @@ menu "Example Configuration"
         config WIFI_AUTH_WPA_WPA2_PSK
             bool "WIFI_AUTH_WPA_WPA2_PSK"
     endchoice
+
+    config SOFTAP_SERVER_IP
+            string "SoftAP Server IP Address"
+            default "192.168.10.1"
+            help
+                The IP address of the TCP server running on the SoftAP ESP32.
+
+    config SOFTAP_SERVER_PORT
+        int "SoftAP Server Port"
+        default 3333
+        help
+            The port number for the TCP server on the SoftAP ESP32.
 
     config MESH_AP_AUTHMODE
         int

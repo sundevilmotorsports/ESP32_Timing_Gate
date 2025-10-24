@@ -1,0 +1,41 @@
+
+menu "Timing Gate Configuration"
+
+    choice NETWORK_PROTOCOL
+        prompt "Network Protocol Selection"
+        default USE_MESH_NETWORK
+        help
+            Select the wireless communication protocol for the timing gate system.
+
+        config USE_MESH_NETWORK
+            bool "ESP Wi-Fi Mesh"
+            help
+                Use a self-healing, multi-hop mesh network.
+
+        config USE_ESPNOW
+            bool "ESP-NOW"
+            help
+                Use a fast, connectionless protocol for low-power, short-distance
+                communication.
+
+    endchoice
+
+    choice DATA_TYPE
+        prompt "Choose Between Fake and Real Data"
+        default USE_REAL_DATA
+        help
+            Select whether or not you want to use data from the lap timers, or synthetic data for testing purposes
+
+        config USE_REAL_DATA
+            bool "Real Data"
+            help
+                Use real data gathered from RTC and DS3231 sensor
+
+        config USE_FAKE_DATA
+            bool "Fake Data"
+            help
+                Use fake data, bypasses reads to RTC and DS3231 sensor
+
+    endchoice
+
+endmenu
