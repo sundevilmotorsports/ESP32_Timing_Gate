@@ -1,425 +1,251 @@
-#include <stdio.h>
-#include "driver/gpio.h"
-#include "nvs_flash.h"
+/*
+ * SPDX-FileCopyrightText: 2022-2023 Espressif Systems (Shanghai) CO LTD
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <inttypes.h>
 #include "esp_log.h"
-#include "mesh.h"
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
-#include <string.h>
-#include "esp_timer.h"
-#include "driver/i2c.h"
-#include "driver/i2c_master.h"
-#include "driver/uart.h"
-#include "espnow.h"
-#include "time.h"
+#include "esp_mac.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/timers.h"
 
-static const char *TAG = "MAIN";
+#include "esp_wifi.h"
+#include "nvs_flash.h"
+#include <sys/socket.h>
 
-#define I2C_MASTER_SCL_IO           GPIO_NUM_14                 /*!< GPIO number used for I2C master clock */
-#define I2C_MASTER_SDA_IO           GPIO_NUM_21                 /*!< GPIO number used for I2C master data  */
-#define I2C_MASTER_NUM              I2C_NUM_0                   /*!< I2C port number for master dev */
-#define I2C_MASTER_FREQ_HZ          400000                      /*!< I2C master clock frequency */
-#define I2C_MASTER_TIMEOUT_MS       10000
-#define TF_ADDR                     0x10
-#define RTC_ADDR                    0b1101000
-#define THRESHOLD 50
+#include "esp_bridge.h"
+#include "esp_mesh_lite.h"
 
-#define RTC_REG_SECONDS 0x00
+static int g_sockfd    = -1;
+static const char *TAG = "local_control";
 
-#define DEBOUNCE_TIME 5
-#define DETECT 50
-
-#define UART_PORT UART_NUM_0
-#define UART_BUF_SIZE 1024
-#define RD_BUF_SIZE 128
-
-#define SQW_GPIO GPIO_NUM_12
-static int state = 0;
-static long change_time = 0;
-static long last_activation = 0;
-
-static volatile int64_t last_sync_us = 0;   // Last sync timestamp (µs)
-static volatile int64_t rtc_seconds = 0;    // DS3231 absolute time in seconds
-
-static QueueHandle_t uart_event_queue = NULL;
-
-long get_time_ms() { return clock() * 1000 / CLOCKS_PER_SEC; }
-
-int debounce(int input) {
-  long current_time = get_time_ms();  
-  if (input != state) {
-    if (change_time == 0) {
-      change_time = current_time;
-    } else if (current_time - change_time >= DEBOUNCE_TIME) {
-      state = input;
-      change_time = 0;      if (input == 1) {
-        last_activation = current_time;
-      }
-    }
-  } else {
-    change_time = 0;
-  }  return state;
-}
-
-i2c_master_dev_handle_t tfmini_dev_handle;
-i2c_master_bus_handle_t bus_handle;
-
-// Function Declarations
-uint16_t getTfData(){
-    uint8_t getData[] = {0x5A, 0x05, 0x00, 0x01, 0x60};    // Send command to device
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (TF_ADDR << 1) | I2C_MASTER_WRITE, true);
-    for(int i = 0; i< sizeof(getData); i++){
-        i2c_master_write_byte(cmd, getData[i], false);
-    }
-    i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 1000 / portTICK_PERIOD_MS);
-    i2c_cmd_link_delete(cmd);    
-    if (ret == ESP_OK) {
-        // Read 9 bytes response from device
-        uint8_t read_data[9];
-        cmd = i2c_cmd_link_create();
-        i2c_master_start(cmd);
-        i2c_master_write_byte(cmd, (TF_ADDR << 1) | I2C_MASTER_READ, true);
-        for(int i = 0; i < 8; i++){
-            i2c_master_read_byte(cmd, &read_data[i], I2C_MASTER_ACK);
-        }
-        i2c_master_read_byte(cmd, &read_data[8], I2C_MASTER_NACK); // Last byte with NACK
-        i2c_master_stop(cmd);
-        ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 1000 / portTICK_PERIOD_MS);
-        i2c_cmd_link_delete(cmd);        
-        if (ret == ESP_OK) { //  && (read_data[3] << 8 | read_data[2]) < 500
-            // ESP_LOGI("I2C", "LiDAR Response:");
-            // printf("Distance %u cm\n", read_data[3] << 8 | read_data[2]);
-            return read_data[3] << 8 | read_data[2];
-        } else {
-            ESP_LOGE("I2C", "Failed to read response");
-            return 0;
-        }
-    }    
-    if (ret != ESP_OK) {
-        ESP_LOGE("I2C", "Failed to send command to device at address 0x10");
-        return 0;
-    }    
-    return 0;
-}
-
-// --- Helper: Read BCD from DS3231 ---
-static uint8_t bcd2dec(uint8_t val) {
-    return (val >> 4) * 10 + (val & 0x0F);
-}
-
-static uint8_t dec2bcd(uint8_t val)
+/**
+ * @brief Create a tcp client
+ */
+static int socket_tcp_client_create(const char *ip, uint16_t port)
 {
-    return ((val / 10) << 4) + (val % 10);
+    ESP_LOGD(TAG, "Create a tcp client, ip: %s, port: %d", ip, port);
+
+    esp_err_t ret = ESP_OK;
+    int sockfd    = -1;
+    struct ifreq iface;
+    memset(&iface, 0x0, sizeof(iface));
+    struct sockaddr_in server_addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(port),
+        .sin_addr.s_addr = inet_addr(ip),
+    };
+
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        ESP_LOGE(TAG, "socket create, sockfd: %d", sockfd);
+        goto ERR_EXIT;
+    }
+
+    esp_netif_get_netif_impl_name(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), iface.ifr_name);
+    if (setsockopt(sockfd, SOL_SOCKET, SO_BINDTODEVICE, &iface, sizeof(struct ifreq)) != 0) {
+        ESP_LOGE(TAG, "Bind [sock=%d] to interface %s fail", sockfd, iface.ifr_name);
+    }
+
+    ret = connect(sockfd, (struct sockaddr *)&server_addr, sizeof(struct sockaddr_in));
+    if (ret < 0) {
+        ESP_LOGD(TAG, "socket connect, ret: %d, ip: %s, port: %d", ret, ip, port);
+        goto ERR_EXIT;
+    }
+    return sockfd;
+
+ERR_EXIT:
+
+    if (sockfd != -1) {
+        close(sockfd);
+    }
+
+    return -1;
 }
 
-// --- Read seconds from DS3231 ---
-static esp_err_t ds3231_get_time(uint8_t *hours, uint8_t *minutes, uint8_t *seconds) {
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (RTC_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, RTC_REG_SECONDS, true);
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (RTC_ADDR << 1) | I2C_MASTER_READ, true);
+void tcp_client_write_task(void *arg)
+{
+    size_t size        = 0;
+    int count          = 0;
+    char *data         = NULL;
+    esp_err_t ret      = ESP_OK;
+    uint8_t sta_mac[6] = {0};
 
-    uint8_t data[3];
-    i2c_master_read(cmd, data, 2, I2C_MASTER_ACK);
-    i2c_master_read_byte(cmd, &data[2], I2C_MASTER_NACK);
+    esp_wifi_get_mac(ESP_IF_WIFI_STA, sta_mac);
 
-    i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 1000 / portTICK_PERIOD_MS);
-    i2c_cmd_link_delete(cmd);
+    ESP_LOGI(TAG, "TCP client write task is running");
 
-    if (ret != ESP_OK) return ret;
+    while (1) {
+        if (g_sockfd == -1) {
+            vTaskDelay(500 / portTICK_PERIOD_MS);
+            g_sockfd = socket_tcp_client_create("192.168.71.1", 8080);
+            continue;
+        }
 
-    *seconds = bcd2dec(data[0]);
-    *minutes = bcd2dec(data[1]);
-    *hours   = bcd2dec(data[2] & 0x3F);
+        vTaskDelay(3000 / portTICK_PERIOD_MS);
 
-    return ESP_OK;
+        size = asprintf(&data, "{\"src_addr\": \"" MACSTR "\",\"data\": \"Hello TCP Server!\",\"level\": %d,\"count\": %d}\r\n",
+                        MAC2STR(sta_mac), esp_mesh_lite_get_level(), count++);
+
+        ESP_LOGD(TAG, "TCP write, size: %d, data: %s", size, data);
+        ret = write(g_sockfd, data, size);
+        free(data);
+
+        if (ret <= 0) {
+            ESP_LOGE(TAG, "<%s> TCP write", strerror(errno));
+            close(g_sockfd);
+            g_sockfd = -1;
+            continue;
+        }
+    }
+
+    ESP_LOGI(TAG, "TCP client write task is exit");
+
+    close(g_sockfd);
+    g_sockfd = -1;
+    if (data) {
+        free(data);
+    }
+    vTaskDelete(NULL);
 }
 
-// --- Interrupt Handler on 1khz SQW rising edge ---
-static void IRAM_ATTR sqw_handler(void* arg) {
-    uint8_t h, m, s;
-    if (ds3231_get_time(&h, &m, &s) == ESP_OK) {
-        rtc_seconds = h * 3600 + m * 60 + s;
-        last_sync_us = esp_timer_get_time();
+/**
+ * @brief Timed printing system information
+ */
+static void print_system_info_timercb(TimerHandle_t timer)
+{
+    uint8_t primary                 = 0;
+    uint8_t sta_mac[6]              = {0};
+    wifi_ap_record_t ap_info        = {0};
+    wifi_second_chan_t second       = 0;
+    wifi_sta_list_t wifi_sta_list   = {0x0};
+
+    esp_wifi_sta_get_ap_info(&ap_info);
+    esp_wifi_get_mac(ESP_IF_WIFI_STA, sta_mac);
+    esp_wifi_ap_get_sta_list(&wifi_sta_list);
+    esp_wifi_get_channel(&primary, &second);
+
+    ESP_LOGI(TAG, "System information, channel: %d, layer: %d, self mac: " MACSTR ", parent bssid: " MACSTR
+             ", parent rssi: %d, free heap: %"PRIu32"", primary,
+             esp_mesh_lite_get_level(), MAC2STR(sta_mac), MAC2STR(ap_info.bssid),
+             (ap_info.rssi != 0 ? ap_info.rssi : -120), esp_get_free_heap_size());
+#if CONFIG_MESH_LITE_NODE_INFO_REPORT
+    ESP_LOGI(TAG, "All node number: %"PRIu32"", esp_mesh_lite_get_mesh_node_number());
+#endif /* MESH_LITE_NODE_INFO_REPORT */
+    for (int i = 0; i < wifi_sta_list.num; i++) {
+        ESP_LOGI(TAG, "Child mac: " MACSTR, MAC2STR(wifi_sta_list.sta[i].mac));
     }
 }
 
-static portMUX_TYPE rtc_sync_mux = portMUX_INITIALIZER_UNLOCKED;
-// --- Get synced microseconds ---
-int64_t get_synced_micros(void) {
-    portENTER_CRITICAL(&rtc_sync_mux);
-    int64_t base_rtc_seconds = rtc_seconds;
-    int64_t last_sync = last_sync_us;
-    portEXIT_CRITICAL(&rtc_sync_mux);
-    int64_t now_us = esp_timer_get_time();
-    int64_t delta_us = now_us - last_sync;
-    return rtc_seconds * 1000000 + delta_us;
+static void ip_event_sta_got_ip_handler(void *arg, esp_event_base_t event_base,
+                                        int32_t event_id, void *event_data)
+{
+    static bool tcp_task = false;
+
+    if (!tcp_task) {
+        xTaskCreate(tcp_client_write_task, "tcp_client_write_task", 4 * 1024, NULL, 5, NULL);
+        tcp_task = true;
+    }
 }
 
-// // --- Get synced microseconds ---
-// int64_t get_synced_micros(void) {
-//     int64_t now_us = esp_timer_get_time();
-//     int64_t delta_us = now_us - last_sync_us;
-//     return rtc_seconds * 1000000 + delta_us;
-// }
+static esp_err_t esp_storage_init(void)
+{
+    esp_err_t ret = nvs_flash_init();
 
-esp_err_t ds3231_set_time(struct tm *time) {
-    uint8_t data[7];
-
-    data[0] = dec2bcd(time->tm_sec);
-    data[1] = dec2bcd(time->tm_min);
-    data[2] = dec2bcd(time->tm_hour);
-
-    /* The week data must be in the range 1 to 7, and to keep the start on the
-     * same day as for tm_wday have it start at 1 on Sunday. */
-    data[3] = dec2bcd(time->tm_wday + 1);
-    data[4] = dec2bcd(time->tm_mday);
-    data[5] = dec2bcd(time->tm_mon + 1);
-    data[6] = dec2bcd(time->tm_year - 100);
-
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (RTC_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, RTC_REG_SECONDS, true);
-    i2c_master_write(cmd, data, 7, true);
-
-    i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 1000 / portTICK_PERIOD_MS);
-    i2c_cmd_link_delete(cmd);
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        // NVS partition was truncated and needs to be erased
+        // Retry nvs_flash_init
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
 
     return ret;
 }
 
-static void uart_init(void){
-    const uart_config_t uart_config = {
-        .baud_rate = 115200,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+static void wifi_init(void)
+{
+    // Station
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = "myssid",
+            .password = "mypassword", // at least 8 characters
+        },
     };
+    esp_bridge_wifi_set_config(WIFI_IF_STA, &wifi_config);
 
-    uart_driver_install(UART_PORT, UART_BUF_SIZE * 2, 0, 20, &uart_event_queue, 0);
-    uart_param_config(UART_PORT, &uart_config);
-    uart_set_pin(UART_PORT, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-
-    ESP_LOGI(TAG, "UART initialized successfully");
+    // Softap
+    wifi_config_t wifi_softap_config = {
+        .ap = {
+            .ssid = CONFIG_BRIDGE_SOFTAP_SSID,
+            .password = CONFIG_BRIDGE_SOFTAP_PASSWORD,
+        },
+    };
+    esp_bridge_wifi_set_config(WIFI_IF_AP, &wifi_softap_config);
 }
 
-void app_main(void)
+void app_wifi_set_softap_info(void)
 {
-    // Initialize NVS
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK( nvs_flash_erase() );
-        ret = nvs_flash_init();
+    char softap_ssid[33];
+    char softap_psw[64];
+    uint8_t softap_mac[6];
+    size_t ssid_size = sizeof(softap_ssid);
+    size_t psw_size = sizeof(softap_psw);
+    esp_wifi_get_mac(WIFI_IF_AP, softap_mac);
+    memset(softap_ssid, 0x0, sizeof(softap_ssid));
+    memset(softap_psw, 0x0, sizeof(softap_psw));
+
+    if (esp_mesh_lite_get_softap_ssid_from_nvs(softap_ssid, &ssid_size) == ESP_OK) {
+        ESP_LOGI(TAG, "Get ssid from nvs: %s", softap_ssid);
+    } else {
+#ifdef CONFIG_BRIDGE_SOFTAP_SSID_END_WITH_THE_MAC
+        snprintf(softap_ssid, sizeof(softap_ssid), "%.25s_%02x%02x%02x", CONFIG_BRIDGE_SOFTAP_SSID, softap_mac[3], softap_mac[4], softap_mac[5]);
+#else
+        snprintf(softap_ssid, sizeof(softap_ssid), "%.32s", CONFIG_BRIDGE_SOFTAP_SSID);
+#endif
+        ESP_LOGI(TAG, "Get ssid from nvs failed, set ssid: %s", softap_ssid);
     }
-    ESP_ERROR_CHECK( ret );
 
-    #if CONFIG_USE_MESH_NETWORK
-        mesh_init();
-    #else
-        wifi_init();
-        espnow_init();
-    #endif
+    if (esp_mesh_lite_get_softap_psw_from_nvs(softap_psw, &psw_size) == ESP_OK) {
+        ESP_LOGI(TAG, "Get psw from nvs: [HIDDEN]");
+    } else {
+        strlcpy(softap_psw, CONFIG_BRIDGE_SOFTAP_PASSWORD, sizeof(softap_psw));
+        ESP_LOGI(TAG, "Get psw from nvs failed, set psw: [HIDDEN]");
+    }
 
-    #if CONFIG_USE_REAL_DATA
-        uint8_t buf[7];
-        i2c_config_t conf = {
-            .mode = I2C_MODE_MASTER,
-            .sda_io_num = I2C_MASTER_SDA_IO,
-            .scl_io_num = I2C_MASTER_SCL_IO,
-            .sda_pullup_en = GPIO_PULLUP_ENABLE,
-            .scl_pullup_en = GPIO_PULLUP_ENABLE,
-            .master.clk_speed = I2C_MASTER_FREQ_HZ,
-        };
-        i2c_param_config(I2C_MASTER_NUM, &conf);
-        i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    esp_mesh_lite_set_softap_info(softap_ssid, softap_psw);
+}
 
-        uart_init();
+void app_main()
+{
+    /**
+     * @brief Set the log level for serial port printing.
+     */
+    esp_log_level_set("*", ESP_LOG_INFO);
 
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    esp_storage_init();
 
-        ESP_LOGI(TAG, "Waiting for rtc sync");
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-        uint8_t data[128];
-        int total_len = 0;
-        int64_t start_time = esp_timer_get_time();
-        const int64_t timeout_us = 10 * 1e6;
+    esp_bridge_create_all_netif();
 
-        while (total_len < sizeof(data) - 1) {
-            int len = uart_read_bytes(UART_NUM_0, &data[total_len], 1, 100 / portTICK_PERIOD_MS);
+    wifi_init();
 
-            if (len > 0) {
-                total_len += len;
-                if (data[total_len - 1] == '\n' || data[total_len - 1] == '\r' || data[total_len - 1] == '\0') {
-                    break;
-                }
-            }
+    esp_mesh_lite_config_t mesh_lite_config = ESP_MESH_LITE_DEFAULT_INIT();
+    esp_mesh_lite_init(&mesh_lite_config);
 
-            if (esp_timer_get_time() - start_time > timeout_us) {
-                ESP_LOGI(TAG, "No timestamp received");
-                break;
-            }
-        }
+    app_wifi_set_softap_info();
 
-        if (total_len > 0) {
-            data[total_len] = '\0';
-            // printf("Received: %.*s\n", total_len, data);
+    esp_mesh_lite_start();
 
-            if (total_len >= 6) {
-                char hour_str[3] = {data[0], data[1], '\0'};
-                char min_str[3] = {data[2], data[3], '\0'};
-                char sec_str[3] = {data[4], data[5], '\0'};
+    /**
+     * @breif Create handler
+     */
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &ip_event_sta_got_ip_handler, NULL, NULL));
 
-                int hours = atoi(hour_str);
-                int minutes = atoi(min_str);
-                int seconds = atoi(sec_str);
-
-                if (hours >= 0 && hours <= 23 && minutes >= 0 && minutes <= 59 && seconds >= 0 && seconds <= 59) {
-                    struct tm time;
-                    time.tm_hour = hours;
-                    time.tm_min = minutes;
-                    time.tm_sec = seconds;
-                    // Not needed
-                    time.tm_wday = 0;
-                    time.tm_mday = 0;
-                    time.tm_mon = 0;
-                    time.tm_year = 125;
-
-                    esp_err_t ret = ds3231_set_time(&time);
-                    if (ret == ESP_OK) {
-                        ESP_LOGI(TAG, "Time set successfully to %02d:%02d:%02d", hours, minutes, seconds);
-                    } else {
-                        ESP_LOGE(TAG, "Failed to set time");
-                    }
-                } else {
-                    ESP_LOGE(TAG, "Invalid time values: %02d:%02d:%02d", hours, minutes, seconds);
-                }
-            } else {
-                ESP_LOGE(TAG, "Invalid timestamp format. Expected HHMMSS, got %d characters", total_len);
-            }
-        } else {
-            ESP_LOGI(TAG, "No timestamp received");
-        }
-
-        uart_driver_delete(UART_NUM_0);
-
-        uint16_t dist = 0;
-        uint16_t prevDist = 0;    // Send command to device
-        #if CONFIG_USE_MESH_NETWORK
-            mesh_packet_t packet;
-        #else
-            espnow_data_t packet;
-        #endif
-        int counter = 0;
-        bool currentState = false;
-        bool prev = false;
-        float epoch = 0;
-        float diff = 0;
-
-        
-        // SQW input pin
-        gpio_config_t io_conf = {
-            .intr_type = GPIO_INTR_POSEDGE,
-            .mode = GPIO_MODE_INPUT,
-            .pin_bit_mask = 1ULL << SQW_GPIO,
-            .pull_up_en = 1,
-        };
-        gpio_config(&io_conf);
-        gpio_install_isr_service(0);
-        gpio_isr_handler_add(SQW_GPIO, sqw_handler, NULL);
-        
-        // 90 Hz loop timing (11.11 ms period)
-        const TickType_t loop_period = pdMS_TO_TICKS(11);  // ~11.11 ms for 90 Hz
-        TickType_t last_wake_time = xTaskGetTickCount();
-        
-        while(1) {
-            prevDist = dist;
-            dist = getTfData(); 
-            // currentState = (abs(dist - prevDist) > THRESHOLD) ? 1 : 0;
-            // if (currentState) {
-            //     detect = !detect;
-            // }
-            prev = currentState;
-            currentState = debounce(dist < DETECT);
-            // printf("Time Delta: %f\n", (float)(get_synced_micros() / 1e6) - (float)(esp_timer_get_time() / 1e6));
-            
-            if (!prev && currentState) {
-                packet.seq_num = counter;
-                float current = (get_synced_micros() / 1e6) - (float)DEBOUNCE_TIME / 1e3;  // seconds
-                diff = current - epoch;
-                epoch = current;
-
-                int data_len = snprintf((char*)packet.data, sizeof(packet.data), "Lap Timer sent time: %f", diff);
-                packet.len = data_len;
-
-                packet.crc = 0;
-                #if CONFIG_USE_MESH_NETWORK
-                    packet.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)&packet, sizeof(mesh_packet_t));
-                #else
-                    packet.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)&packet, sizeof(espnow_data_t));
-                #endif
-                
-                ESP_LOGI(TAG, "Sending message #%d with time difference: %f sec", counter, diff);
-                #if CONFIG_USE_MESH_NETWORK
-                    mesh_send_once(&packet);
-                #else
-                    espnow_send_once(&packet);
-                #endif
-                counter++;
-
-                vTaskDelay(pdMS_TO_TICKS(200)); 
-            }
-            
-            // Maintain 90 Hz loop rate
-            vTaskDelayUntil(&last_wake_time, loop_period);
-        }
-        // THIS CODE IS NOT TESTED, USE WITH CAUTION
-    #elif CONFIG_USE_FAKE_DATA
-        #if CONFIG_USE_MESH_NETWORK
-            mesh_packet_t packet;
-        #else
-            espnow_data_t packet;
-        #endif
-        int counter = 0;
-        bool currentState = false;
-        bool prev = false;
-        float epoch = 0;
-        float diff = 0;
-
-        while(1) {
-            vTaskDelay(pdMS_TO_TICKS(rand() % (5000 + 1))); // Create random time between 0 and 5000ms
-            float current = (get_synced_micros() / 1e6) - (float)DEBOUNCE_TIME / 1e3;  // seconds
-            diff = current - epoch;
-            epoch = current;
-
-            int data_len = snprintf((char*)packet.data, sizeof(packet.data), "Lap Timer sent time: %f", diff);
-            packet.len = data_len;
-
-            packet.crc = 0;
-            #if CONFIG_USE_MESH_NETWORK
-                packet.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)&packet, sizeof(mesh_packet_t));
-            #else
-                packet.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)&packet, sizeof(espnow_data_t));
-            #endif
-            packet.seq_num = counter;
-
-            ESP_LOGI(TAG, "Sending message #%d with time difference: %f sec", counter, diff);
-            #if CONFIG_USE_MESH_NETWORK
-                mesh_send_once(&packet);
-            #else
-                espnow_send_once(&packet);
-            #endif 
-            counter++;
-        }
-    #endif
-
+    TimerHandle_t timer = xTimerCreate("print_system_info", 10000 / portTICK_PERIOD_MS,
+                                       true, NULL, print_system_info_timercb);
+    xTimerStart(timer, 0);
 }

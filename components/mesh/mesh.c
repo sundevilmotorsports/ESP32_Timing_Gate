@@ -441,6 +441,7 @@ esp_err_t mesh_init(void)
     ESP_ERROR_CHECK(esp_event_handler_register(MESH_EVENT, ESP_EVENT_ANY_ID, &mesh_event_handler, NULL));
     /* force esp as non-root*/
     ESP_ERROR_CHECK(esp_mesh_fix_root(false));
+    ESP_ERROR_CHECK(esp_mesh_set_self_organized(false, false));
     /* set mesh topology */
     ESP_ERROR_CHECK(esp_mesh_set_topology(CONFIG_MESH_TOPOLOGY));
     /* set mesh max layer according to the topology */
@@ -463,11 +464,14 @@ esp_err_t mesh_init(void)
     /* mesh ID */
     memcpy((uint8_t *) &cfg.mesh_id, MESH_ID, 6);
     /* router */
-    cfg.channel = CONFIG_MESH_CHANNEL;
-    cfg.router.ssid_len = strlen(CONFIG_MESH_ROUTER_SSID);
-    memcpy((uint8_t *) &cfg.router.ssid, CONFIG_MESH_ROUTER_SSID, cfg.router.ssid_len);
-    memcpy((uint8_t *) &cfg.router.password, CONFIG_MESH_ROUTER_PASSWD,
-        strlen(CONFIG_MESH_ROUTER_PASSWD));
+    cfg.channel = 6;
+
+    // Minimal dummy router config (required by API)
+    cfg.router.ssid_len = 1;
+    cfg.router.ssid[0] = 'x';  // Just one character
+    cfg.router.password[0] = '\0';
+
+    ESP_ERROR_CHECK(esp_mesh_set_config(&cfg));
     /* mesh softAP */
     ESP_ERROR_CHECK(esp_mesh_set_ap_authmode(CONFIG_MESH_AP_AUTHMODE));
     cfg.mesh_ap.max_connection = CONFIG_MESH_AP_CONNECTIONS;
