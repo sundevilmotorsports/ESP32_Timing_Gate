@@ -411,6 +411,18 @@ static void wifi_event_sta_disconnected_handler(void *arg, esp_event_base_t even
     }
 }
 
+void led_task() {
+    for (;;) {
+        if (g_sockfd == -1) {
+            gpio_set_level(LED, 1);
+        } else {
+            gpio_set_level(LED, 0);
+        }
+
+        vTaskDelay(25 / portTICK_PERIOD_MS);
+    }
+}
+
 // IP Event Handler
 static void ip_event_sta_got_ip_handler(void *arg, esp_event_base_t event_base,
                                         int32_t event_id, void *event_data) {
@@ -621,4 +633,6 @@ void app_main(void) {
     // Start timing gate task - runs continuously regardless of WiFi
     ESP_LOGI(TAG, "Starting timing gate task...");
     xTaskCreate(timing_gate_task, "timing_gate_task", 4 * 1024, NULL, 6, NULL);
+
+    xTaskCreate(led_task, "led_task", 1024, NULL, 7, NULL);
 }
