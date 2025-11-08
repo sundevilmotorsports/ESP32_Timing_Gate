@@ -38,8 +38,10 @@ static const char *TAG = "MESH_TIMING_GATE";
 #define DETECT                     5
 
 // UART Configuration
-#define UART_PORT                  UART_NUM_0
+#define UART_PORT                  UART_NUM_1
 #define UART_BUF_SIZE              1024
+#define UART_TX_PIN                GPIO_NUM_21
+#define UART_RX_PIN                GPIO_NUM_14
 
 // RTC SQW Pin
 #define SQW_GPIO                   GPIO_NUM_12
@@ -98,6 +100,37 @@ int debounce(int input) {
         change_time = 0;
     }
     return state;
+}
+
+void tf_set_config(void) {
+    const uart_config_t uart_config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+    };
+
+    uart_driver_install(UART_NUM_1, UART_BUF_SIZE * 2, 0, 20, &uart_event_queue, 0);
+    uart_param_config(UART_NUM_1, &uart_config);
+    uart_set_pin(UART_NUM_1, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+
+    uint8_t packet[] = {0x5A, 0x05, 0x0A, 0x01, 0};
+    uint8_t checksum = 0;
+    // Calculate checksum (simple sum of all bytes)
+    for (int i = 0; i < sizeof(packet); i++) {
+        checksum += packet[i];
+    }
+    packet[4] = checksum;
+    // Send the data bytes
+    uart_write_bytes(UART_PORT, (const char*)packet, sizeof(packet));
+    ESP_LOGI("UART", "Sent packet: 0x%02X 0x%02X 0x%02X 0x%02X, Checksum: 0x%02X",
+             packet[0], packet[1], packet[2], packet[3], checksum);
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+    uint8_t save[] = {0x5A, 0x04, 0x11, 0x6F};
+    uart_write_bytes(UART_PORT, (const char *)save, sizeof(save));
+
+    uart_driver_delete(UART_NUM_1);
 }
 
 // TFMini LiDAR Functions
@@ -227,7 +260,7 @@ static void uart_init(void) {
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
     };
 
-    uart_driver_install(UART_PORT, UART_BUF_SIZE * 2, 0, 20, &uart_event_queue, 0);
+    uart_driver_install(UART_NUM_0, UART_BUF_SIZE * 2, 0, 20, &uart_event_queue, 0);
     uart_param_config(UART_PORT, &uart_config);
     uart_set_pin(UART_PORT, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 
@@ -498,6 +531,8 @@ void app_main(void) {
 
     vTaskDelay(1000 / portTICK_PERIOD_MS);
 
+    // tf_set_config();
+
     // Initialize UART for RTC sync
     uart_init();
     vTaskDelay(1000 / portTICK_PERIOD_MS);
@@ -510,21 +545,21 @@ void app_main(void) {
     int64_t start_time = esp_timer_get_time();
     const int64_t timeout_us = 10 * 1e6;
 
-    // while (total_len < sizeof(data) - 1) {
-    //     int len = uart_read_bytes(UART_NUM_0, &data[total_len], 1, 100 / portTICK_PERIOD_MS);
-    //
-    //     if (len > 0) {
-    //         total_len += len;
-    //         if (data[total_len - 1] == '\n' || data[total_len - 1] == '\r' || data[total_len - 1] == '\0') {
-    //             break;
-    //         }
-    //     }
-    //
-    //     if (esp_timer_get_time() - start_time > timeout_us) {
-    //         ESP_LOGI(TAG, "No timestamp received");
-    //         break;
-    //     }
-    // }
+    while (total_len < sizeof(data) - 1) {
+        int len = uart_read_bytes(UART_NUM_0, &data[total_len], 1, 100 / portTICK_PERIOD_MS);
+
+        if (len > 0) {
+            total_len += len;
+            if (data[total_len - 1] == '\n' || data[total_len - 1] == '\r' || data[total_len - 1] == '\0') {
+                break;
+            }
+        }
+
+        if (esp_timer_get_time() - start_time > timeout_us) {
+            ESP_LOGI(TAG, "No timestamp received");
+            break;
+        }
+    }
 
     if (total_len >= 6) {
         data[total_len] = '\0';
