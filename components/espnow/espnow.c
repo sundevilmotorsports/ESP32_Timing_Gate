@@ -3,27 +3,46 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_crc.h"
+#include "esp_event.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include <string.h>
 #include "espnow.h"
+#include <stdio.h>
+#include <stdint.h>
+#include <ctype.h>
+#include <stdlib.h>
 
-// --- Configuration ---
 #define ESPNOW_WIFI_MODE    WIFI_MODE_STA
 #define ESPNOW_WIFI_IF      ESP_IF_WIFI_STA
 #define ESPNOW_CHANNEL      1
-#define SEND_PERIOD_MS      500 // Send a message every 500 milliseconds
+#define ACK_SEND_DELAY      CONFIG_ACK_SEND_DELAY
 #define PAYLOAD_BUFFER_SIZE 50  // Max size of the data payload
 
-// --- Globals & TAG ---
-static const char *TAG = "ESPNOW_SENDER";
+#define SEND_QUEUE_SIZE     CONFIG_SEND_QUEUE_SIZE
+#define RECV_QUEUE_SIZE     CONFIG_RECV_QUEUE_SIZE
+#define MAX_QUEUE_DELAY 512
 
-// Broadcast MAC address
-static uint8_t s_broadcast_mac[ESP_NOW_ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+#if CONFIG_ESPNOW_ROLE_STATION
+    #define ESPNOW_WIFI_MODE WIFI_MODE_STA
+    #define ESPNOW_WIFI_IF   ESP_IF_WIFI_STA
+    #define ROLE             "STATION"
+    static const char *TAG = "ESPNOW_STATION";
+#else
+    #define ESPNOW_WIFI_MODE WIFI_MODE_STA
+    #define ESPNOW_WIFI_IF   ESP_IF_WIFI_STA
+    #define ROLE             "RECEIVER"
+    static const char *TAG = "ESPNOW_RECEIVER";
+#endif
 
-static void espnow_deinit(espnow_send_param_t *send_param);
+static QueueHandle_t espnow_send_queue = NULL;
+static QueueHandle_t espnow_recv_queue = NULL;
+
+// Broadcast + Receiver MAC Address
+uint8_t s_broadcast_mac[ESP_NOW_ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+uint8_t receiver_mac_addr[ESP_NOW_ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 
 void wifi_init(void) {
     ESP_ERROR_CHECK(esp_netif_init());
@@ -52,14 +71,47 @@ static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_stat
     }
 }
 
-esp_err_t espnow_send_once(const espnow_data_t *data_to_send) {
+static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len)
+{
+    espnow_event_t evt;
+    espnow_event_recv_cb_t *recv_cb = &evt.info.recv_cb;
+    uint8_t * mac_addr = recv_info->src_addr;
+    uint8_t * des_addr = recv_info->des_addr;
+
+    if (mac_addr == NULL || data == NULL || len <= 0) {
+        ESP_LOGE(TAG, "Receive cb arg error");
+        return;
+    }
+
+    if (IS_BROADCAST_ADDR(des_addr)) {
+        ESP_LOGD(TAG, "Receive broadcast ESPNOW data");
+    } else {
+        ESP_LOGD(TAG, "Receive unicast ESPNOW data");
+    }
+
+    evt.id = ESPNOW_RECV_CB;
+    memcpy(recv_cb->mac_addr, mac_addr, ESP_NOW_ETH_ALEN);
+    recv_cb->data = malloc(len);
+    if (recv_cb->data == NULL) {
+        ESP_LOGE(TAG, "Malloc receive data fail");
+        return;
+    }
+    memcpy(recv_cb->data, data, len);
+    recv_cb->data_len = len;
+    if (xQueueSend(espnow_recv_queue, &evt, MAX_QUEUE_DELAY) != pdTRUE) {
+        ESP_LOGW(TAG, "Send receive queue fail");
+        return;
+    }
+}
+
+esp_err_t espnow_send_once(const uint8_t *send_addr, const espnow_data_t *data_to_send) {
     if (data_to_send == NULL) {
         ESP_LOGE(TAG, "Data to send is NULL");
         return ESP_ERR_INVALID_ARG;
     }
     
     // Send the data
-    esp_err_t result = esp_now_send(s_broadcast_mac, (const uint8_t *)data_to_send, sizeof(espnow_data_t));
+    esp_err_t result = esp_now_send((const uint8_t *)send_addr, (const uint8_t *)data_to_send, sizeof(espnow_data_t));
     
     if (result != ESP_OK) {
         ESP_LOGE(TAG, "ESP-NOW single send error: %s", esp_err_to_name(result));
@@ -68,49 +120,95 @@ esp_err_t espnow_send_once(const espnow_data_t *data_to_send) {
     return result;
 }
 
-static void espnow_send_task(void *pvParameters) {
-    espnow_send_param_t *send_param = (espnow_send_param_t *)pvParameters;
-    espnow_data_t *packet_data = (espnow_data_t *)send_param->buffer;
+static void espnow_send_ack_task(void *pvParameters) {
     uint32_t message_count = 0;
-
-    ESP_LOGI(TAG, "Starting periodic sending task...");
-
-    while (1) {
-        // 1. Prepare the data payload
-        packet_data->seq_num = message_count++;
-        snprintf((char*)packet_data->data, PAYLOAD_BUFFER_SIZE, "Hello Broadcast! Msg %lu", message_count);
-
-        // 2. Calculate and set the CRC checksum
-        // The CRC is calculated over the packet data, excluding the CRC field itself.
-        packet_data->crc = 0;
-        packet_data->crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)packet_data, send_param->len);
-
-        // 3. Send the data
-        if (esp_now_send(send_param->dest_mac, send_param->buffer, send_param->len) != ESP_OK) {
-            ESP_LOGE(TAG, "ESP-NOW send error");
-            // In a real application, you might want to handle this error more gracefully,
-            // e.g., by retrying a few times before giving up.
-        }
-
-        // 4. Wait for the next sending period
-        vTaskDelay(pdMS_TO_TICKS(SEND_PERIOD_MS));
+    espnow_data_t *packet = malloc(sizeof(espnow_data_t));
+    if (packet == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate memory for ACK packet");
+        vTaskDelete(NULL);
+        return;
     }
 
-    // This part of the code will not be reached in this example,
-    // but it's good practice to include cleanup logic.
-    ESP_LOGI(TAG, "Stopping sending task and cleaning up.");
-    espnow_deinit(send_param);
+    while (1) {
+        int payload_len = snprintf((char*)packet->data, sizeof(packet->data), "ACK; Seq Num: %lu", message_count);
+        packet->len = payload_len;
+        packet->type = ACK;
+        packet->seq_num = message_count++;
+        packet->crc = 0;
+        size_t total_size = sizeof(espnow_data_t) - sizeof(packet->data) + packet->len;
+        packet->crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)packet, total_size);
+
+        if (esp_now_send(s_broadcast_mac, (uint8_t *)packet, total_size) != ESP_OK) {
+            ESP_LOGE(TAG, "ESP-NOW send error");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(ACK_SEND_DELAY));
+    }
+    free(packet);
     vTaskDelete(NULL);
 }
 
+static void espnow_recv_task(void *pvParameters) {
+    espnow_event_t evt;
+    int recv_seq = 0;
+
+    while(1) {
+        if (xQueueReceive(espnow_recv_queue, &evt, portMAX_DELAY) == pdTRUE) {
+            espnow_event_recv_cb_t *recv_cb = &evt.info.recv_cb;
+            espnow_data_t *packet = (espnow_data_t *)evt.info.recv_cb.data;
+            if (packet->type == ACK) {
+                ESP_LOGI(TAG, "Received ACK from: "MACSTR"", MAC2STR(recv_cb->mac_addr));
+
+                if (esp_now_is_peer_exist(recv_cb->mac_addr) == false) {
+                    esp_now_peer_info_t *peer = malloc(sizeof(esp_now_peer_info_t));
+                    if (peer == NULL) {
+                        ESP_LOGE(TAG, "Malloc peer information fail");
+                        esp_now_deinit();
+                        vTaskDelete(NULL);
+                    }
+                    memset(peer, 0, sizeof(esp_now_peer_info_t));
+                    peer->channel = CONFIG_ESPNOW_CHANNEL;
+                    peer->ifidx = ESPNOW_WIFI_IF;
+                    peer->encrypt = false;
+                    memcpy(peer->lmk, CONFIG_ESPNOW_LMK, ESP_NOW_KEY_LEN);
+                    memcpy(peer->peer_addr, recv_cb->mac_addr, ESP_NOW_ETH_ALEN);
+                    ESP_ERROR_CHECK( esp_now_add_peer(peer) );
+                    free(peer);
+                } 
+                // Change receiver mac addr
+                memcpy(receiver_mac_addr, recv_cb->mac_addr, ESP_NOW_ETH_ALEN);
+            } else if (packet->type == REQUEST) {
+                ESP_LOGI(TAG, "Receive %dth send f}rom: "MACSTR", len: %d", recv_seq, MAC2STR(recv_cb->mac_addr), recv_cb->data_len);
+                // for (size_t i = 0; i < recv_cb->data_len-4; i++) {
+                //     if (isprint(recv_cb->data[i])) {
+                //         printf("%c", recv_cb->data[i]);
+                //     }
+                // }
+                printf("Received Message:  %.*s\n", packet->len, (char*)packet->data);
+                recv_seq++;
+            } else {
+                ESP_LOGE(TAG, "INCORRECT PACKET TYPE DETECTED: %d", packet->type);
+                esp_now_deinit();
+                vTaskDelete(NULL);
+            }
+            if (recv_cb->data) {
+                free(recv_cb->data);
+                recv_cb->data = NULL;
+            }
+        }
+    }
+}
+
 void espnow_init(void) {
-    // 1. Initialize ESP-NOW
     ESP_ERROR_CHECK(esp_now_init());
 
-    // 2. Register the send callback function
     ESP_ERROR_CHECK(esp_now_register_send_cb(espnow_send_cb));
+    ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
 
-    // 3. Add a broadcast peer
+    #if CONFIG_ESPNOW_ENABLE_LONG_RANGE
+        ESP_ERROR_CHECK( esp_wifi_set_protocol(ESPNOW_WIFI_IF, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N|WIFI_PROTOCOL_LR) );
+    #endif
+
     esp_now_peer_info_t peer_info = {};
     peer_info.channel = ESPNOW_CHANNEL;
     peer_info.ifidx = ESPNOW_WIFI_IF;
@@ -118,9 +216,7 @@ void espnow_init(void) {
     memcpy(peer_info.peer_addr, s_broadcast_mac, ESP_NOW_ETH_ALEN);
     ESP_ERROR_CHECK(esp_now_add_peer(&peer_info));
 
-    // 4. Prepare send parameters and create the sending task
-    // IMPORTANT: We must dynamically allocate memory for send_param and its buffer
-    // because it's passed to a task that will outlive this function.
+    // Start sends for ACKs
     espnow_send_param_t *send_param = malloc(sizeof(espnow_send_param_t));
     if (send_param == NULL) {
         ESP_LOGE(TAG, "Failed to allocate memory for send parameters");
@@ -139,11 +235,15 @@ void espnow_init(void) {
     }
 
     memcpy(send_param->dest_mac, s_broadcast_mac, ESP_NOW_ETH_ALEN);
+    espnow_recv_queue = xQueueCreate(CONFIG_RECV_QUEUE_SIZE, sizeof(espnow_event_t));
 
-    // xTaskCreate(espnow_send_task, "espnow_send_task", 2048, send_param, 4, NULL);
+    xTaskCreate(espnow_recv_task, "espnow_recv_task", 4096, NULL, 4, NULL);
+    if (strcmp(ROLE, "RECEIVER") == 0) {
+        xTaskCreate(espnow_send_ack_task, "espnow_send_ack_task", 4096, NULL, 4, NULL);
+    }
 }
 
-static void espnow_deinit(espnow_send_param_t *send_param) {
+void espnow_deinit(espnow_send_param_t *send_param) {
     if (send_param != NULL) {
         free(send_param->buffer);
         free(send_param);

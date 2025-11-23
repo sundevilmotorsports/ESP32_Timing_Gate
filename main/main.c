@@ -30,28 +30,18 @@ static const char *TAG = "MESH_TIMING_GATE";
 #define I2C_MASTER_FREQ_HZ          400000
 #define TF_ADDR                     0x10
 #define RTC_ADDR                    0b1101000
-#define RTC_REG_SECONDS             0x00
+#define THRESHOLD 50
 
-// Timing Gate Configuration
-#define THRESHOLD                   50
-#define DEBOUNCE_TIME              5
-#define DETECT                     5
+#define RTC_REG_SECONDS 0x00
 
-// UART Configuration
-#define UART_PORT                  UART_NUM_1
-#define UART_BUF_SIZE              1024
-#define UART_TX_PIN                GPIO_NUM_21
-#define UART_RX_PIN                GPIO_NUM_14
+#define DEBOUNCE_TIME 5
+#define DETECT 500
 
-// RTC SQW Pin
-#define SQW_GPIO                   GPIO_NUM_12
+#define UART_PORT UART_NUM_0
+#define UART_BUF_SIZE 1024
+#define RD_BUF_SIZE 128
 
-#define LED                        GPIO_NUM_19
-
-// TCP Server Configuration
-static int g_sockfd = -1;
-
-// Timing Gate State
+#define SQW_GPIO GPIO_NUM_12
 static int state = 0;
 static long change_time = 0;
 static long last_activation = 0;
@@ -604,35 +594,124 @@ void app_main(void) {
 
     uart_driver_delete(UART_NUM_0);
 
-    gpio_config_t led_conf = {
-        .intr_type = GPIO_INTR_DISABLE,
-        .mode = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = 1ULL << LED,
-        .pull_down_en = 0,
-        .pull_up_en = 0,
-    };
-    gpio_config(&led_conf);
+        uint16_t dist = 0;
+        uint16_t prevDist = 0;    // Send command to device
+        #if CONFIG_USE_MESH_NETWORK
+            mesh_packet_t packet;
+        #else
+            espnow_data_t packet;
+        #endif
+        int counter = 0;
+        bool currentState = false;
+        bool prev = false;
+        float epoch = 0;
+        float diff = 0;
 
-    // Setup SQW interrupt
-    gpio_config_t io_conf = {
-        .intr_type = GPIO_INTR_POSEDGE,
-        .mode = GPIO_MODE_INPUT,
-        .pin_bit_mask = 1ULL << SQW_GPIO,
-        .pull_up_en = 1,
-    };
-    gpio_config(&io_conf);
-    gpio_install_isr_service(0);
-    gpio_isr_handler_add(SQW_GPIO, sqw_handler, NULL);
+        
+        // SQW input pin
+        gpio_config_t io_conf = {
+            .intr_type = GPIO_INTR_POSEDGE,
+            .mode = GPIO_MODE_INPUT,
+            .pin_bit_mask = 1ULL << SQW_GPIO,
+            .pull_up_en = 1,
+        };
+        gpio_config(&io_conf);
+        gpio_install_isr_service(0);
+        gpio_isr_handler_add(SQW_GPIO, sqw_handler, NULL);
+        
+        // 90 Hz loop timing (11.11 ms period)
+        const TickType_t loop_period = pdMS_TO_TICKS(11);  // ~11.11 ms for 90 Hz
+        TickType_t last_wake_time = xTaskGetTickCount();
+        
+        while(1) {
+            prevDist = dist;
+            dist = getTfData(); 
+            // currentState = (abs(dist - prevDist) > THRESHOLD) ? 1 : 0;
+            // if (currentState) {
+            //     detect = !detect;
+            // }
+            prev = currentState;
+            currentState = debounce(dist < DETECT);
+            // printf("Time Delta: %f\n", (float)(get_synced_micros() / 1e6) - (float)(esp_timer_get_time() / 1e6));
+            
+            if (!prev && currentState) {
+                packet.seq_num = counter;
+                float current = (get_synced_micros() / 1e6) - (float)DEBOUNCE_TIME / 1e3;  // seconds
+                diff = current - epoch;
+                epoch = current;
 
-    // Register event handlers
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                                        &ip_event_sta_got_ip_handler, NULL, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED,
-                                                        &wifi_event_sta_disconnected_handler, NULL, NULL));
+                int data_len = snprintf((char*)packet.data, sizeof(packet.data), "%f", diff);
+                packet.len = data_len;
+                packet.type = REQUEST;
 
-    // Start timing gate task - runs continuously regardless of WiFi
-    ESP_LOGI(TAG, "Starting timing gate task...");
-    xTaskCreate(timing_gate_task, "timing_gate_task", 4 * 1024, NULL, 6, NULL);
+                packet.crc = 0;
+                #if CONFIG_USE_MESH_NETWORK
+                    packet.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)&packet, sizeof(mesh_packet_t));
+                #else
+                    packet.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)&packet, sizeof(espnow_data_t));
+                #endif
+                
+                ESP_LOGI(TAG, "Sending message #%d with time difference: %f sec", counter, diff);
+                #if CONFIG_ESPNOW_ROLE_RECEIVER
+                    printf("%.*s\n", packet->len, (char*)packet.data);
+                #else
+                    #if CONFIG_USE_MESH_NETWORK
+                        mesh_send_once(&packet);
+                    #else
+                        espnow_send_once(receiver_mac_addr, &packet);
+                    #endif 
+                #endif
+                counter++;
 
-    xTaskCreate(led_task, "led_task", 1024, NULL, 7, NULL);
+                vTaskDelay(pdMS_TO_TICKS(1000)); 
+            }
+            
+            // Maintain 90 Hz loop rate
+            vTaskDelayUntil(&last_wake_time, loop_period);
+        }
+        // THIS CODE IS NOT TESTED, USE WITH CAUTION
+    #elif CONFIG_USE_FAKE_DATA
+        #if CONFIG_USE_MESH_NETWORK
+            mesh_packet_t packet;
+        #else
+            espnow_data_t packet;
+        #endif
+        int counter = 0;
+        bool currentState = false;
+        bool prev = false;
+        float epoch = 0;
+        float diff = 0;
+
+        while(1) {
+            vTaskDelay(pdMS_TO_TICKS(rand() % (5000 + 1))); // Create random time between 0 and 5000ms
+            float current = (get_synced_micros() / 1e6) - (float)DEBOUNCE_TIME / 1e3;  // seconds
+            diff = current - epoch;
+            epoch = current;
+
+            int data_len = snprintf((char*)packet.data, sizeof(packet.data), "%f", diff);
+            packet.len = data_len;
+            packet.type = REQUEST;
+            packet.crc = 0;
+
+            #if CONFIG_USE_MESH_NETWORK
+                packet.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)&packet, sizeof(mesh_packet_t));
+            #else
+                packet.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)&packet, sizeof(espnow_data_t));
+            #endif
+            packet.seq_num = counter;
+
+            ESP_LOGI(TAG, "Sending message #%d with time difference: %f sec", counter, diff);
+            #if CONFIG_ESPNOW_ROLE_RECEIVER
+                printf("%.*s\n", packet->len, (char*)packet.data);
+            #else
+                #if CONFIG_USE_MESH_NETWORK
+                    mesh_send_once(&packet);
+                #else
+                    espnow_send_once(receiver_mac_addr, &packet);
+                #endif 
+            #endif
+            counter++;
+        }
+    #endif
+
 }

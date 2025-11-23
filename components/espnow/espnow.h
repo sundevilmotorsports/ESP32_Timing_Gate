@@ -1,36 +1,57 @@
-/* ESPNOW Example
-
-   This example code is in the Public Domain (or CC0 licensed, at your option.)
-
-   Unless required by applicable law or agreed to in writing, this
-   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-   CONDITIONS OF ANY KIND, either express or implied.
-*/
-
 #ifndef ESPNOW_H
 #define ESPNOW_H
 
 #include "esp_now.h"
 #include "esp_crc.h"
 
-/* ESPNOW can work in both station and softap mode. It is configured in menuconfig. */
-#if CONFIG_ESPNOW_WIFI_MODE_STATION
-#define ESPNOW_WIFI_MODE WIFI_MODE_STA
-#define ESPNOW_WIFI_IF   ESP_IF_WIFI_STA
-#else
-#define ESPNOW_WIFI_MODE WIFI_MODE_AP
-#define ESPNOW_WIFI_IF   ESP_IF_WIFI_AP
-#endif
+#define IS_BROADCAST_ADDR(addr) (memcmp(addr, s_broadcast_mac, ESP_NOW_ETH_ALEN) == 0)
 
-#define ESPNOW_QUEUE_SIZE           6
+extern uint8_t s_broadcast_mac[ESP_NOW_ETH_ALEN];
+extern uint8_t receiver_mac_addr[ESP_NOW_ETH_ALEN];
 
-#define IS_BROADCAST_ADDR(addr) (memcmp(addr, s_example_broadcast_mac, ESP_NOW_ETH_ALEN) == 0)
+typedef enum {
+    ESPNOW_SEND_CB,
+    ESPNOW_RECV_CB,
+} espnow_event_id_t;
+
+typedef struct {
+    uint8_t mac_addr[ESP_NOW_ETH_ALEN];
+    esp_now_send_status_t status;
+} espnow_event_send_cb_t;
+
+typedef struct {
+    uint8_t mac_addr[ESP_NOW_ETH_ALEN];
+    uint8_t *data;
+    int data_len;
+} espnow_event_recv_cb_t;
+
+typedef union {
+    espnow_event_send_cb_t send_cb;
+    espnow_event_recv_cb_t recv_cb;
+} espnow_event_info_t;
+
+typedef struct {
+    espnow_event_id_t id;
+    espnow_event_info_t info;
+} espnow_event_t;
+
+typedef enum {
+    ACK,
+    REQUEST
+} espnow_msg_type_t;
+
+typedef enum {
+    ESPNOW_BROADCAST,
+    ESPNOW_UNICAST,
+    ESPNOW_MAX,
+} espnow_data_type_t;
 
 typedef struct __attribute__((packed)) {
+    espnow_msg_type_t type;
     uint16_t seq_num;   // Sequence number to keep track of messages
-    uint8_t data[30];   // Message content
     uint16_t crc;       // CRC checksum for data integrity
     size_t len;
+    uint8_t data[1458];   // Message content
 } espnow_data_t;
 
 
@@ -42,7 +63,8 @@ typedef struct {
 
 
 void espnow_init(void);
+void espnow_deinit(espnow_send_param_t *send_param);
 void wifi_init(void);
-esp_err_t espnow_send_once(const espnow_data_t *data_to_send);
+esp_err_t espnow_send_once(const uint8_t *send_addr, const espnow_data_t *data_to_send);
 
 #endif
