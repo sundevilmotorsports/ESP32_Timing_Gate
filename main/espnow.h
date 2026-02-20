@@ -3,6 +3,7 @@
 
 #include "esp_now.h"
 #include "esp_crc.h"
+#include "driver/gpio.h"
 
 #define IS_BROADCAST_ADDR(addr) (memcmp(addr, s_broadcast_mac, ESP_NOW_ETH_ALEN) == 0)
 
@@ -39,6 +40,7 @@ typedef enum {
     ACK,
     REQUEST,
     PING,
+    IDENT
 } espnow_msg_type_t;
 
 typedef enum {
@@ -62,7 +64,7 @@ typedef struct {
 } espnow_send_param_t;
 
 
-void espnow_init(void);
+void espnow_init(const gpio_num_t blink);
 void espnow_deinit(espnow_send_param_t *send_param);
 void wifi_init(void);
 esp_err_t espnow_send_once(const uint8_t *send_addr, const espnow_data_t *data_to_send);

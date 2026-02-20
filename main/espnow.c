@@ -15,6 +15,8 @@
 #include <ctype.h>
 #include <stdlib.h>
 
+#include "driver/gpio.h"
+
 #define ESPNOW_WIFI_MODE    WIFI_MODE_STA
 #define ESPNOW_WIFI_IF      ESP_IF_WIFI_STA
 #define ESPNOW_CHANNEL      1
@@ -25,6 +27,8 @@
 #define SEND_QUEUE_SIZE     CONFIG_SEND_QUEUE_SIZE
 #define RECV_QUEUE_SIZE     CONFIG_RECV_QUEUE_SIZE
 #define MAX_QUEUE_DELAY 512
+
+gpio_num_t led;
 
 #if CONFIG_ESPNOW_ROLE_STATION
     #define ESPNOW_WIFI_MODE WIFI_MODE_STA
@@ -149,6 +153,18 @@ static void espnow_send_ack_task(void *pvParameters) {
     vTaskDelete(NULL);
 }
 
+static void identify_task(void *arg) {
+    for (uint8_t i = 0; i < 11; i++) {
+        gpio_set_level(led, i % 2);
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    vTaskDelete(NULL);
+}
+
+static void identify() {
+    xTaskCreate(identify_task, "identify", 2048, NULL, 5, NULL);
+}
+
 static void espnow_recv_task(void *pvParameters) {
     espnow_event_t evt;
     int recv_seq = 0;
@@ -192,6 +208,9 @@ static void espnow_recv_task(void *pvParameters) {
                 response.crc = 0;
                 response.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)&response, sizeof(espnow_data_t));
                 esp_now_send(recv_cb->mac_addr, (uint8_t *)&response, sizeof(espnow_data_t));
+            } else if (packet->type == IDENT) {
+                ESP_LOGI(TAG, "Ident");
+                identify();
             } else {
                 ESP_LOGE(TAG, "INCORRECT PACKET TYPE DETECTED: %d", packet->type);
                 esp_now_deinit();
@@ -205,7 +224,7 @@ static void espnow_recv_task(void *pvParameters) {
     }
 }
 
-void espnow_init(void) {
+void espnow_init(const gpio_num_t blink) {
     ESP_ERROR_CHECK(esp_now_init());
 
     ESP_ERROR_CHECK(esp_now_register_send_cb(espnow_send_cb));
@@ -214,6 +233,8 @@ void espnow_init(void) {
     #if CONFIG_ESPNOW_ENABLE_LONG_RANGE
         ESP_ERROR_CHECK( esp_wifi_set_protocol(ESPNOW_WIFI_IF, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N|WIFI_PROTOCOL_LR) );
     #endif
+
+    led = blink;
 
     esp_now_peer_info_t peer_info = {};
     peer_info.channel = ESPNOW_CHANNEL;

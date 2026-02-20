@@ -34,6 +34,8 @@ static const char *TAG = "MAIN";
 #define UART_BUF_SIZE 1024
 #define RD_BUF_SIZE 128
 
+#define LED_PIN GPIO_NUM_2
+
 #define SQW_GPIO GPIO_NUM_12
 static int state = 0;
 static long change_time = 0;
@@ -224,8 +226,14 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
+    gpio_config_t io = {
+        .pin_bit_mask = (1ULL << LED_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    gpio_config(&io);
+
     wifi_init();
-    espnow_init();
+    espnow_init(LED_PIN);
 
 #if USE_REAL_DATA
     ESP_LOGI(TAG, "Using real data");
