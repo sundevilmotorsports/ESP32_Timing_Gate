@@ -2,10 +2,8 @@
 #include "driver/gpio.h"
 #include "nvs_flash.h"
 #include "esp_log.h"
-#include "mesh.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-#include <string.h>
 #include "esp_timer.h"
 #include "driver/i2c.h"
 #include "driver/i2c_master.h"
@@ -14,6 +12,9 @@
 #include "time.h"
 
 static const char *TAG = "MAIN";
+
+#define USE_REAL_DATA false
+#define USE_FAKE_DATA true
 
 #define I2C_MASTER_SCL_IO           GPIO_NUM_14                 /*!< GPIO number used for I2C master clock */
 #define I2C_MASTER_SDA_IO           GPIO_NUM_21                 /*!< GPIO number used for I2C master data  */
@@ -222,14 +223,12 @@ void app_main(void)
     }
     ESP_ERROR_CHECK( ret );
 
-    #if CONFIG_USE_MESH_NETWORK
-        mesh_init();
-    #else
-        wifi_init();
-        espnow_init();
-    #endif
+    wifi_init();
+    espnow_init();
 
-    #if CONFIG_USE_REAL_DATA
+    #if USE_REAL_DATA
+    ESP_LOGI(TAG, "Using real data");
+
         uint8_t buf[7];
         i2c_config_t conf = {
             .mode = I2C_MODE_MASTER,
@@ -314,11 +313,8 @@ void app_main(void)
 
         uint16_t dist = 0;
         uint16_t prevDist = 0;    // Send command to device
-        #if CONFIG_USE_MESH_NETWORK
-            mesh_packet_t packet;
-        #else
-            espnow_data_t packet;
-        #endif
+        espnow_data_t packet;
+
         int counter = 0;
         bool currentState = false;
         bool prev = false;
@@ -363,22 +359,11 @@ void app_main(void)
                 packet.type = REQUEST;
 
                 packet.crc = 0;
-                #if CONFIG_USE_MESH_NETWORK
-                    packet.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)&packet, sizeof(mesh_packet_t));
-                #else
-                    packet.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)&packet, sizeof(espnow_data_t));
-                #endif
+                packet.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)&packet, sizeof(espnow_data_t));
 
                 ESP_LOGI(TAG, "Sending message #%d with time difference: %f sec", counter, diff);
-                #if CONFIG_ESPNOW_ROLE_RECEIVER
-                    printf("%.*s\n", packet->len, (char*)packet.data);
-                #else
-                    #if CONFIG_USE_MESH_NETWORK
-                        mesh_send_once(&packet);
-                    #else
-                        espnow_send_once(receiver_mac_addr, &packet);
-                    #endif
-                #endif
+                espnow_send_once(receiver_mac_addr, &packet);
+
                 counter++;
 
                 vTaskDelay(pdMS_TO_TICKS(1000));
@@ -387,13 +372,12 @@ void app_main(void)
             // Maintain 90 Hz loop rate
             vTaskDelayUntil(&last_wake_time, loop_period);
         }
-        // THIS CODE IS NOT TESTED, USE WITH CAUTION
-    #elif CONFIG_USE_FAKE_DATA
-        #if CONFIG_USE_MESH_NETWORK
-            mesh_packet_t packet;
-        #else
-            espnow_data_t packet;
-        #endif
+
+    #elif USE_FAKE_DATA
+    ESP_LOGI(TAG, "Using fake data");
+
+        espnow_data_t packet;
+
         int counter = 0;
         bool currentState = false;
         bool prev = false;
@@ -419,15 +403,9 @@ void app_main(void)
             packet.seq_num = counter;
 
             ESP_LOGI(TAG, "Sending message #%d with time difference: %f sec", counter, diff);
-            #if CONFIG_ESPNOW_ROLE_RECEIVER
-                printf("%.*s\n", packet->len, (char*)packet.data);
-            #else
-                #if CONFIG_USE_MESH_NETWORK
-                    mesh_send_once(&packet);
-                #else
-                    espnow_send_once(receiver_mac_addr, &packet);
-                #endif
-            #endif
+
+            espnow_send_once(receiver_mac_addr, &packet);
+
             counter++;
         }
     #endif
