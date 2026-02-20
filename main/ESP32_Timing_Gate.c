@@ -46,7 +46,7 @@ static QueueHandle_t uart_event_queue = NULL;
 long get_time_ms() { return clock() * 1000 / CLOCKS_PER_SEC; }
 
 int debounce(int input) {
-  long current_time = get_time_ms();  
+  long current_time = get_time_ms();
   if (input != state) {
     if (change_time == 0) {
       change_time = current_time;
@@ -75,7 +75,7 @@ uint16_t getTfData(){
     }
     i2c_master_stop(cmd);
     esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 1000 / portTICK_PERIOD_MS);
-    i2c_cmd_link_delete(cmd);    
+    i2c_cmd_link_delete(cmd);
     if (ret == ESP_OK) {
         // Read 9 bytes response from device
         uint8_t read_data[9];
@@ -88,7 +88,7 @@ uint16_t getTfData(){
         i2c_master_read_byte(cmd, &read_data[8], I2C_MASTER_NACK); // Last byte with NACK
         i2c_master_stop(cmd);
         ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 1000 / portTICK_PERIOD_MS);
-        i2c_cmd_link_delete(cmd);        
+        i2c_cmd_link_delete(cmd);
         if (ret == ESP_OK) { //  && (read_data[3] << 8 | read_data[2]) < 500
             // ESP_LOGI("I2C", "LiDAR Response:");
             // printf("Distance %u cm\n", read_data[3] << 8 | read_data[2]);
@@ -97,11 +97,11 @@ uint16_t getTfData(){
             ESP_LOGE("I2C", "Failed to read response");
             return 0;
         }
-    }    
+    }
     if (ret != ESP_OK) {
         ESP_LOGE("I2C", "Failed to send command to device at address 0x10");
         return 0;
-    }    
+    }
     return 0;
 }
 
@@ -325,7 +325,7 @@ void app_main(void)
         float epoch = 0;
         float diff = 0;
 
-        
+
         // SQW input pin
         gpio_config_t io_conf = {
             .intr_type = GPIO_INTR_POSEDGE,
@@ -336,14 +336,14 @@ void app_main(void)
         gpio_config(&io_conf);
         gpio_install_isr_service(0);
         gpio_isr_handler_add(SQW_GPIO, sqw_handler, NULL);
-        
+
         // 90 Hz loop timing (11.11 ms period)
         const TickType_t loop_period = pdMS_TO_TICKS(11);  // ~11.11 ms for 90 Hz
         TickType_t last_wake_time = xTaskGetTickCount();
-        
+
         while(1) {
             prevDist = dist;
-            dist = getTfData(); 
+            dist = getTfData();
             // currentState = (abs(dist - prevDist) > THRESHOLD) ? 1 : 0;
             // if (currentState) {
             //     detect = !detect;
@@ -351,7 +351,7 @@ void app_main(void)
             prev = currentState;
             currentState = debounce(dist < DETECT);
             // printf("Time Delta: %f\n", (float)(get_synced_micros() / 1e6) - (float)(esp_timer_get_time() / 1e6));
-            
+
             if (!prev && currentState) {
                 packet.seq_num = counter;
                 float current = (get_synced_micros() / 1e6) - (float)DEBOUNCE_TIME / 1e3;  // seconds
@@ -368,7 +368,7 @@ void app_main(void)
                 #else
                     packet.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)&packet, sizeof(espnow_data_t));
                 #endif
-                
+
                 ESP_LOGI(TAG, "Sending message #%d with time difference: %f sec", counter, diff);
                 #if CONFIG_ESPNOW_ROLE_RECEIVER
                     printf("%.*s\n", packet->len, (char*)packet.data);
@@ -377,13 +377,13 @@ void app_main(void)
                         mesh_send_once(&packet);
                     #else
                         espnow_send_once(receiver_mac_addr, &packet);
-                    #endif 
+                    #endif
                 #endif
                 counter++;
 
-                vTaskDelay(pdMS_TO_TICKS(1000)); 
+                vTaskDelay(pdMS_TO_TICKS(1000));
             }
-            
+
             // Maintain 90 Hz loop rate
             vTaskDelayUntil(&last_wake_time, loop_period);
         }
@@ -426,7 +426,7 @@ void app_main(void)
                     mesh_send_once(&packet);
                 #else
                     espnow_send_once(receiver_mac_addr, &packet);
-                #endif 
+                #endif
             #endif
             counter++;
         }
