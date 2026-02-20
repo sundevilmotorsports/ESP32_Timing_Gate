@@ -39,39 +39,41 @@ static int state = 0;
 static long change_time = 0;
 static long last_activation = 0;
 
-static volatile int64_t last_sync_us = 0;   // Last sync timestamp (µs)
-static volatile int64_t rtc_seconds = 0;    // DS3231 absolute time in seconds
+static volatile int64_t last_sync_us = 0; // Last sync timestamp (µs)
+static volatile int64_t rtc_seconds = 0; // DS3231 absolute time in seconds
 
 static QueueHandle_t uart_event_queue = NULL;
 
 long get_time_ms() { return clock() * 1000 / CLOCKS_PER_SEC; }
 
 int debounce(int input) {
-  long current_time = get_time_ms();
-  if (input != state) {
-    if (change_time == 0) {
-      change_time = current_time;
-    } else if (current_time - change_time >= DEBOUNCE_TIME) {
-      state = input;
-      change_time = 0;      if (input == 1) {
-        last_activation = current_time;
-      }
+    long current_time = get_time_ms();
+    if (input != state) {
+        if (change_time == 0) {
+            change_time = current_time;
+        } else if (current_time - change_time >= DEBOUNCE_TIME) {
+            state = input;
+            change_time = 0;
+            if (input == 1) {
+                last_activation = current_time;
+            }
+        }
+    } else {
+        change_time = 0;
     }
-  } else {
-    change_time = 0;
-  }  return state;
+    return state;
 }
 
 i2c_master_dev_handle_t tfmini_dev_handle;
 i2c_master_bus_handle_t bus_handle;
 
 // Function Declarations
-uint16_t getTfData(){
-    uint8_t getData[] = {0x5A, 0x05, 0x00, 0x01, 0x60};    // Send command to device
+uint16_t getTfData() {
+    uint8_t getData[] = {0x5A, 0x05, 0x00, 0x01, 0x60}; // Send command to device
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
     i2c_master_write_byte(cmd, (TF_ADDR << 1) | I2C_MASTER_WRITE, true);
-    for(int i = 0; i< sizeof(getData); i++){
+    for (int i = 0; i < sizeof(getData); i++) {
         i2c_master_write_byte(cmd, getData[i], false);
     }
     i2c_master_stop(cmd);
@@ -83,14 +85,15 @@ uint16_t getTfData(){
         cmd = i2c_cmd_link_create();
         i2c_master_start(cmd);
         i2c_master_write_byte(cmd, (TF_ADDR << 1) | I2C_MASTER_READ, true);
-        for(int i = 0; i < 8; i++){
+        for (int i = 0; i < 8; i++) {
             i2c_master_read_byte(cmd, &read_data[i], I2C_MASTER_ACK);
         }
         i2c_master_read_byte(cmd, &read_data[8], I2C_MASTER_NACK); // Last byte with NACK
         i2c_master_stop(cmd);
         ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 1000 / portTICK_PERIOD_MS);
         i2c_cmd_link_delete(cmd);
-        if (ret == ESP_OK) { //  && (read_data[3] << 8 | read_data[2]) < 500
+        if (ret == ESP_OK) {
+            //  && (read_data[3] << 8 | read_data[2]) < 500
             // ESP_LOGI("I2C", "LiDAR Response:");
             // printf("Distance %u cm\n", read_data[3] << 8 | read_data[2]);
             return read_data[3] << 8 | read_data[2];
@@ -111,8 +114,7 @@ static uint8_t bcd2dec(uint8_t val) {
     return (val >> 4) * 10 + (val & 0x0F);
 }
 
-static uint8_t dec2bcd(uint8_t val)
-{
+static uint8_t dec2bcd(uint8_t val) {
     return ((val / 10) << 4) + (val % 10);
 }
 
@@ -137,13 +139,13 @@ static esp_err_t ds3231_get_time(uint8_t *hours, uint8_t *minutes, uint8_t *seco
 
     *seconds = bcd2dec(data[0]);
     *minutes = bcd2dec(data[1]);
-    *hours   = bcd2dec(data[2] & 0x3F);
+    *hours = bcd2dec(data[2] & 0x3F);
 
     return ESP_OK;
 }
 
 // --- Interrupt Handler on 1khz SQW rising edge ---
-static void IRAM_ATTR sqw_handler(void* arg) {
+static void IRAM_ATTR sqw_handler(void *arg) {
     uint8_t h, m, s;
     if (ds3231_get_time(&h, &m, &s) == ESP_OK) {
         rtc_seconds = h * 3600 + m * 60 + s;
@@ -197,7 +199,7 @@ esp_err_t ds3231_set_time(struct tm *time) {
     return ret;
 }
 
-static void uart_init(void){
+static void uart_init(void) {
     const uart_config_t uart_config = {
         .baud_rate = 115200,
         .data_bits = UART_DATA_8_BITS,
@@ -213,201 +215,191 @@ static void uart_init(void){
     ESP_LOGI(TAG, "UART initialized successfully");
 }
 
-void app_main(void)
-{
+void app_main(void) {
     // Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK( nvs_flash_erase() );
+        ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
-    ESP_ERROR_CHECK( ret );
+    ESP_ERROR_CHECK(ret);
 
     wifi_init();
     espnow_init();
 
-    #if USE_REAL_DATA
+#if USE_REAL_DATA
     ESP_LOGI(TAG, "Using real data");
 
-        uint8_t buf[7];
-        i2c_config_t conf = {
-            .mode = I2C_MODE_MASTER,
-            .sda_io_num = I2C_MASTER_SDA_IO,
-            .scl_io_num = I2C_MASTER_SCL_IO,
-            .sda_pullup_en = GPIO_PULLUP_ENABLE,
-            .scl_pullup_en = GPIO_PULLUP_ENABLE,
-            .master.clk_speed = I2C_MASTER_FREQ_HZ,
-        };
-        i2c_param_config(I2C_MASTER_NUM, &conf);
-        i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    uint8_t buf[7];
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_MASTER_SDA_IO,
+        .scl_io_num = I2C_MASTER_SCL_IO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_MASTER_FREQ_HZ,
+    };
+    i2c_param_config(I2C_MASTER_NUM, &conf);
+    i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
 
-        uart_init();
+    uart_init();
 
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
 
-        ESP_LOGI(TAG, "Waiting for rtc sync");
+    ESP_LOGI(TAG, "Waiting for rtc sync");
 
-        uint8_t data[128];
-        int total_len = 0;
-        int64_t start_time = esp_timer_get_time();
-        const int64_t timeout_us = 10 * 1e6;
+    uint8_t data[128];
+    int total_len = 0;
+    int64_t start_time = esp_timer_get_time();
+    const int64_t timeout_us = 10 * 1e6;
 
-        while (total_len < sizeof(data) - 1) {
-            int len = uart_read_bytes(UART_NUM_0, &data[total_len], 1, 100 / portTICK_PERIOD_MS);
+    while (total_len < sizeof(data) - 1) {
+        int len = uart_read_bytes(UART_NUM_0, &data[total_len], 1, 100 / portTICK_PERIOD_MS);
 
-            if (len > 0) {
-                total_len += len;
-                if (data[total_len - 1] == '\n' || data[total_len - 1] == '\r' || data[total_len - 1] == '\0') {
-                    break;
-                }
-            }
-
-            if (esp_timer_get_time() - start_time > timeout_us) {
-                ESP_LOGI(TAG, "No timestamp received");
+        if (len > 0) {
+            total_len += len;
+            if (data[total_len - 1] == '\n' || data[total_len - 1] == '\r' || data[total_len - 1] == '\0') {
                 break;
             }
         }
 
-        if (total_len > 0) {
-            data[total_len] = '\0';
-            // printf("Received: %.*s\n", total_len, data);
+        if (esp_timer_get_time() - start_time > timeout_us) {
+            ESP_LOGI(TAG, "No timestamp received");
+            break;
+        }
+    }
 
-            if (total_len >= 6) {
-                char hour_str[3] = {data[0], data[1], '\0'};
-                char min_str[3] = {data[2], data[3], '\0'};
-                char sec_str[3] = {data[4], data[5], '\0'};
+    if (total_len > 0) {
+        data[total_len] = '\0';
+        // printf("Received: %.*s\n", total_len, data);
 
-                int hours = atoi(hour_str);
-                int minutes = atoi(min_str);
-                int seconds = atoi(sec_str);
+        if (total_len >= 6) {
+            char hour_str[3] = {data[0], data[1], '\0'};
+            char min_str[3] = {data[2], data[3], '\0'};
+            char sec_str[3] = {data[4], data[5], '\0'};
 
-                if (hours >= 0 && hours <= 23 && minutes >= 0 && minutes <= 59 && seconds >= 0 && seconds <= 59) {
-                    struct tm time;
-                    time.tm_hour = hours;
-                    time.tm_min = minutes;
-                    time.tm_sec = seconds;
-                    // Not needed
-                    time.tm_wday = 0;
-                    time.tm_mday = 0;
-                    time.tm_mon = 0;
-                    time.tm_year = 125;
+            int hours = atoi(hour_str);
+            int minutes = atoi(min_str);
+            int seconds = atoi(sec_str);
 
-                    esp_err_t ret = ds3231_set_time(&time);
-                    if (ret == ESP_OK) {
-                        ESP_LOGI(TAG, "Time set successfully to %02d:%02d:%02d", hours, minutes, seconds);
-                    } else {
-                        ESP_LOGE(TAG, "Failed to set time");
-                    }
+            if (hours >= 0 && hours <= 23 && minutes >= 0 && minutes <= 59 && seconds >= 0 && seconds <= 59) {
+                struct tm time;
+                time.tm_hour = hours;
+                time.tm_min = minutes;
+                time.tm_sec = seconds;
+                // Not needed
+                time.tm_wday = 0;
+                time.tm_mday = 0;
+                time.tm_mon = 0;
+                time.tm_year = 125;
+
+                esp_err_t ret = ds3231_set_time(&time);
+                if (ret == ESP_OK) {
+                    ESP_LOGI(TAG, "Time set successfully to %02d:%02d:%02d", hours, minutes, seconds);
                 } else {
-                    ESP_LOGE(TAG, "Invalid time values: %02d:%02d:%02d", hours, minutes, seconds);
+                    ESP_LOGE(TAG, "Failed to set time");
                 }
             } else {
-                ESP_LOGE(TAG, "Invalid timestamp format. Expected HHMMSS, got %d characters", total_len);
+                ESP_LOGE(TAG, "Invalid time values: %02d:%02d:%02d", hours, minutes, seconds);
             }
         } else {
-            ESP_LOGI(TAG, "No timestamp received");
+            ESP_LOGE(TAG, "Invalid timestamp format. Expected HHMMSS, got %d characters", total_len);
         }
+    } else {
+        ESP_LOGI(TAG, "No timestamp received");
+    }
 
-        uart_driver_delete(UART_NUM_0);
+    uart_driver_delete(UART_NUM_0);
 
-        uint16_t dist = 0;
-        uint16_t prevDist = 0;    // Send command to device
-        espnow_data_t packet;
+    uint16_t dist = 0;
+    uint16_t prevDist = 0; // Send command to device
+    espnow_data_t packet;
 
-        int counter = 0;
-        bool currentState = false;
-        bool prev = false;
-        float epoch = 0;
-        float diff = 0;
+    int counter = 0;
+    bool currentState = false;
+    bool prev = false;
+    int64_t epoch_us = 0;
+    int64_t diff_us = 0;
 
+    // SQW input pin
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_POSEDGE,
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = 1ULL << SQW_GPIO,
+        .pull_up_en = 1,
+    };
+    gpio_config(&io_conf);
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(SQW_GPIO, sqw_handler, NULL);
 
-        // SQW input pin
-        gpio_config_t io_conf = {
-            .intr_type = GPIO_INTR_POSEDGE,
-            .mode = GPIO_MODE_INPUT,
-            .pin_bit_mask = 1ULL << SQW_GPIO,
-            .pull_up_en = 1,
-        };
-        gpio_config(&io_conf);
-        gpio_install_isr_service(0);
-        gpio_isr_handler_add(SQW_GPIO, sqw_handler, NULL);
+    // 90 Hz loop timing (11.11 ms period)
+    const TickType_t loop_period = pdMS_TO_TICKS(11); // ~11.11 ms for 90 Hz
+    TickType_t last_wake_time = xTaskGetTickCount();
 
-        // 90 Hz loop timing (11.11 ms period)
-        const TickType_t loop_period = pdMS_TO_TICKS(11);  // ~11.11 ms for 90 Hz
-        TickType_t last_wake_time = xTaskGetTickCount();
+    while (1) {
+        prevDist = dist;
+        dist = getTfData();
+        // currentState = (abs(dist - prevDist) > THRESHOLD) ? 1 : 0;
+        // if (currentState) {
+        //     detect = !detect;
+        // }
+        prev = currentState;
+        currentState = debounce(dist < DETECT);
+        // printf("Time Delta: %f\n", (float)(get_synced_micros() / 1e6) - (float)(esp_timer_get_time() / 1e6));
 
-        while(1) {
-            prevDist = dist;
-            dist = getTfData();
-            // currentState = (abs(dist - prevDist) > THRESHOLD) ? 1 : 0;
-            // if (currentState) {
-            //     detect = !detect;
-            // }
-            prev = currentState;
-            currentState = debounce(dist < DETECT);
-            // printf("Time Delta: %f\n", (float)(get_synced_micros() / 1e6) - (float)(esp_timer_get_time() / 1e6));
+        if (!prev && currentState) {
+            packet.seq_num = counter;
+            int64_t current_us = get_synced_micros() - (int64_t)DEBOUNCE_TIME * 1000;
+            int64_t diff_us = current_us - epoch_us;
+            epoch_us = current_us;
 
-            if (!prev && currentState) {
-                packet.seq_num = counter;
-                float current = (get_synced_micros() / 1e6) - (float)DEBOUNCE_TIME / 1e3;  // seconds
-                diff = current - epoch;
-                epoch = current;
-
-                int data_len = snprintf((char*)packet.data, sizeof(packet.data), "%f", diff);
-                packet.len = data_len;
-                packet.type = REQUEST;
-
-                packet.crc = 0;
-                packet.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)&packet, sizeof(espnow_data_t));
-
-                ESP_LOGI(TAG, "Sending message #%d with time difference: %f sec", counter, diff);
-                espnow_send_once(receiver_mac_addr, &packet);
-
-                counter++;
-
-                vTaskDelay(pdMS_TO_TICKS(1000));
-            }
-
-            // Maintain 90 Hz loop rate
-            vTaskDelayUntil(&last_wake_time, loop_period);
-        }
-
-    #elif USE_FAKE_DATA
-    ESP_LOGI(TAG, "Using fake data");
-
-        espnow_data_t packet;
-
-        int counter = 0;
-        bool currentState = false;
-        bool prev = false;
-        float epoch = 0;
-        float diff = 0;
-
-        while(1) {
-            vTaskDelay(pdMS_TO_TICKS(rand() % (5000 + 1))); // Create random time between 0 and 5000ms
-            float current = (get_synced_micros() / 1e6) - (float)DEBOUNCE_TIME / 1e3;  // seconds
-            diff = current - epoch;
-            epoch = current;
-
-            int data_len = snprintf((char*)packet.data, sizeof(packet.data), "%f", diff);
+            int data_len = snprintf((char*)packet.data, sizeof(packet.data), "%lld,%lld", current_us, diff_us);
             packet.len = data_len;
             packet.type = REQUEST;
             packet.crc = 0;
+            packet.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *) &packet, sizeof(espnow_data_t));
 
-            #if CONFIG_USE_MESH_NETWORK
-                packet.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)&packet, sizeof(mesh_packet_t));
-            #else
-                packet.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)&packet, sizeof(espnow_data_t));
-            #endif
-            packet.seq_num = counter;
-
-            ESP_LOGI(TAG, "Sending message #%d with time difference: %f sec", counter, diff);
-
+            ESP_LOGI(TAG, "Sending message #%d | timestamp: %lld us | diff: %lld us", counter, current_us, diff_us);
             espnow_send_once(receiver_mac_addr, &packet);
 
             counter++;
+            vTaskDelay(pdMS_TO_TICKS(1000));
         }
-    #endif
 
+        // Maintain 90 Hz loop rate
+        vTaskDelayUntil(&last_wake_time, loop_period);
+    }
+
+#elif USE_FAKE_DATA
+    ESP_LOGI(TAG, "Using fake data");
+
+    espnow_data_t packet;
+
+    int counter = 0;
+    bool currentState = false;
+    bool prev = false;
+    int64_t epoch_us = 0;
+    int64_t diff_us = 0;
+
+    while(1) {
+        vTaskDelay(pdMS_TO_TICKS(rand() % (5000 + 1)));
+
+        int64_t current_us = esp_timer_get_time();
+        int64_t diff_us = current_us - epoch_us;
+        epoch_us = current_us;
+
+        int data_len = snprintf((char*)packet.data, sizeof(packet.data), "%lld,%lld", current_us, diff_us);
+        packet.len = data_len;
+        packet.type = REQUEST;
+        packet.crc = 0;
+        packet.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)&packet, sizeof(espnow_data_t));
+        packet.seq_num = counter;
+
+        ESP_LOGI(TAG, "Sending message #%d | timestamp: %lld us | diff: %lld us", counter, current_us, diff_us);
+
+        espnow_send_once(receiver_mac_addr, &packet);
+        counter++;
+    }
+#endif
 }

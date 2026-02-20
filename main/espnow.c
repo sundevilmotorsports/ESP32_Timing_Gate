@@ -186,6 +186,12 @@ static void espnow_recv_task(void *pvParameters) {
                 // }
                 printf("Received Message:  %.*s\n", packet->len, (char*)packet->data);
                 recv_seq++;
+            } else if (packet->type == PING) {
+                espnow_data_t response;
+                response.type = PING;
+                response.crc = 0;
+                response.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)&response, sizeof(espnow_data_t));
+                esp_now_send(recv_cb->mac_addr, (uint8_t *)&response, sizeof(espnow_data_t));
             } else {
                 ESP_LOGE(TAG, "INCORRECT PACKET TYPE DETECTED: %d", packet->type);
                 esp_now_deinit();
