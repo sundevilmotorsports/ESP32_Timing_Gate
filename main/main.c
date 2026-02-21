@@ -356,32 +356,34 @@ void app_main(void)
                 packet.seq_num = counter;
                 float current = (get_synced_micros() / 1e6) - (float)DEBOUNCE_TIME / 1e3;  // seconds
                 diff = current - epoch;
-                epoch = current;
+                if(diff>1.0){ //check if time difference is greater than 1 second to avoid multiple detections
+                    packet.seq_num=counter;
+                    epoch = current;
 
-                int data_len = snprintf((char*)packet.data, sizeof(packet.data), "%f", diff);
-                packet.len = data_len;
-                packet.type = REQUEST;
+                    int data_len = snprintf((char*)packet.data, sizeof(packet.data), "%f", diff);
+                    packet.len = data_len;
+                    packet.type = REQUEST;
 
-                packet.crc = 0;
-                #if CONFIG_USE_MESH_NETWORK
-                    packet.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)&packet, sizeof(mesh_packet_t));
-                #else
-                    packet.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)&packet, sizeof(espnow_data_t));
-                #endif
-                
-                ESP_LOGI(TAG, "Sending message #%d with time difference: %f sec", counter, diff);
-                #if CONFIG_ESPNOW_ROLE_RECEIVER
-                    printf("%.*s\n", packet->len, (char*)packet.data);
-                #else
+                    packet.crc = 0;
                     #if CONFIG_USE_MESH_NETWORK
-                        mesh_send_once(&packet);
+                        packet.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)&packet, sizeof(mesh_packet_t));
                     #else
-                        espnow_send_once(receiver_mac_addr, &packet);
-                    #endif 
-                #endif
-                counter++;
-
-                vTaskDelay(pdMS_TO_TICKS(1000)); 
+                        packet.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)&packet, sizeof(espnow_data_t));
+                    #endif
+                    
+                    ESP_LOGI(TAG, "Sending message #%d with time difference: %f sec", counter, diff);
+                    #if CONFIG_ESPNOW_ROLE_RECEIVER
+                        printf("%.*s\n", packet->len, (char*)packet.data);
+                    #else
+                        #if CONFIG_USE_MESH_NETWORK
+                            mesh_send_once(&packet);
+                        #else
+                            espnow_send_once(receiver_mac_addr, &packet);
+                        #endif 
+                    #endif
+                    counter++;
+                }
+                //vTaskDelay(pdMS_TO_TICKS(1000)); 
             }
             
             // Maintain 90 Hz loop rate
