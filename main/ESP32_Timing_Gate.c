@@ -13,8 +13,8 @@
 
 static const char *TAG = "MAIN";
 
-#define USE_REAL_DATA false
-#define USE_FAKE_DATA true
+#define USE_REAL_DATA true
+#define USE_FAKE_DATA false
 
 #define I2C_MASTER_SCL_IO           GPIO_NUM_14                 /*!< GPIO number used for I2C master clock */
 #define I2C_MASTER_SDA_IO           GPIO_NUM_21                 /*!< GPIO number used for I2C master data  */
@@ -28,13 +28,13 @@ static const char *TAG = "MAIN";
 #define RTC_REG_SECONDS 0x00
 
 #define DEBOUNCE_TIME 5
-#define DETECT 500
+#define DETECT 50
 
 #define UART_PORT UART_NUM_0
 #define UART_BUF_SIZE 1024
 #define RD_BUF_SIZE 128
 
-#define LED_PIN GPIO_NUM_2
+#define LED_PIN GPIO_NUM_19
 
 #define SQW_GPIO GPIO_NUM_12
 static int state = 0;
@@ -146,25 +146,50 @@ static esp_err_t ds3231_get_time(uint8_t *hours, uint8_t *minutes, uint8_t *seco
     return ESP_OK;
 }
 
-// --- Interrupt Handler on 1khz SQW rising edge ---
+static volatile int64_t sqw_edge_us = 0;
+static TaskHandle_t rtc_sync_task_handle = NULL;
+static portMUX_TYPE rtc_sync_mux = portMUX_INITIALIZER_UNLOCKED;
+
+// --- Interrupt Handler on 1 Hz SQW rising edge ---
 static void IRAM_ATTR sqw_handler(void *arg) {
-    uint8_t h, m, s;
-    if (ds3231_get_time(&h, &m, &s) == ESP_OK) {
-        rtc_seconds = h * 3600 + m * 60 + s;
-        last_sync_us = esp_timer_get_time();
+    sqw_edge_us = esp_timer_get_time();
+    BaseType_t higher_priority_task_woken = pdFALSE;
+    vTaskNotifyGiveFromISR(rtc_sync_task_handle, &higher_priority_task_woken);
+    portYIELD_FROM_ISR(higher_priority_task_woken);
+}
+
+// --- Task that does the I2C read after the SQW edge ---
+static void rtc_sync_task(void *arg) {
+    while (1) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        uint8_t h, m, s;
+        if (ds3231_get_time(&h, &m, &s) == ESP_OK) {
+            portENTER_CRITICAL(&rtc_sync_mux);
+            rtc_seconds = (int64_t)h * 3600 + m * 60 + s;
+            last_sync_us = sqw_edge_us;
+            portEXIT_CRITICAL(&rtc_sync_mux);
+            ESP_LOGI(TAG, "RTC sync: %02d:%02d:%02d", h, m, s);
+        } else {
+            ESP_LOGE(TAG, "RTC sync failed");
+        }
     }
 }
 
-static portMUX_TYPE rtc_sync_mux = portMUX_INITIALIZER_UNLOCKED;
 // --- Get synced microseconds ---
 int64_t get_synced_micros(void) {
     portENTER_CRITICAL(&rtc_sync_mux);
     int64_t base_rtc_seconds = rtc_seconds;
     int64_t last_sync = last_sync_us;
     portEXIT_CRITICAL(&rtc_sync_mux);
+
+    if (last_sync == 0) {
+        ESP_LOGW(TAG, "RTC not synced, returning raw timer value");
+        return esp_timer_get_time();
+    }
+
     int64_t now_us = esp_timer_get_time();
     int64_t delta_us = now_us - last_sync;
-    return rtc_seconds * 1000000 + delta_us;
+    return base_rtc_seconds * 1000000LL + delta_us;
 }
 
 // // --- Get synced microseconds ---
@@ -231,6 +256,10 @@ void app_main(void) {
         .mode = GPIO_MODE_OUTPUT,
     };
     gpio_config(&io);
+
+    gpio_set_level(LED_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    gpio_set_level(LED_PIN, 0);
 
     wifi_init();
     espnow_init(LED_PIN);
@@ -305,6 +334,10 @@ void app_main(void) {
                 esp_err_t ret = ds3231_set_time(&time);
                 if (ret == ESP_OK) {
                     ESP_LOGI(TAG, "Time set successfully to %02d:%02d:%02d", hours, minutes, seconds);
+                    for (size_t i = 1; i < 11; i++) {
+                        gpio_set_level(LED_PIN, i % 2);
+                        vTaskDelay(pdMS_TO_TICKS(200));
+                    }
                 } else {
                     ESP_LOGE(TAG, "Failed to set time");
                 }
@@ -330,6 +363,20 @@ void app_main(void) {
     int64_t epoch_us = 0;
     int64_t diff_us = 0;
 
+    // Seed RTC time immediately on boot
+    {
+        uint8_t h, m, s;
+        if (ds3231_get_time(&h, &m, &s) == ESP_OK) {
+            portENTER_CRITICAL(&rtc_sync_mux);
+            rtc_seconds = (int64_t)h * 3600 + m * 60 + s;
+            last_sync_us = esp_timer_get_time();
+            portEXIT_CRITICAL(&rtc_sync_mux);
+            ESP_LOGI(TAG, "RTC boot seed: %02d:%02d:%02d", h, m, s);
+        } else {
+            ESP_LOGE(TAG, "RTC boot seed failed — timestamps will be time-since-boot until first SQW edge");
+        }
+    }
+
     // SQW input pin
     gpio_config_t io_conf = {
         .intr_type = GPIO_INTR_POSEDGE,
@@ -338,6 +385,7 @@ void app_main(void) {
         .pull_up_en = 1,
     };
     gpio_config(&io_conf);
+    xTaskCreate(rtc_sync_task, "rtc_sync", 4096, NULL, 10, &rtc_sync_task_handle);
     gpio_install_isr_service(0);
     gpio_isr_handler_add(SQW_GPIO, sqw_handler, NULL);
 
