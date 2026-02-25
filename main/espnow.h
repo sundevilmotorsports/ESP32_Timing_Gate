@@ -40,7 +40,8 @@ typedef enum {
     ACK,
     REQUEST,
     PING,
-    IDENT
+    IDENT,
+    OK,
 } espnow_msg_type_t;
 
 typedef enum {

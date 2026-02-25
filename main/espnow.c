@@ -44,6 +44,7 @@ gpio_num_t led;
 
 static QueueHandle_t espnow_send_queue = NULL;
 static QueueHandle_t espnow_recv_queue = NULL;
+static QueueHandle_t espnow_ok_queue   = NULL;   // OK confirmations from receiver
 
 // Broadcast + Receiver MAC Address
 uint8_t s_broadcast_mac[ESP_NOW_ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
@@ -114,15 +115,44 @@ esp_err_t espnow_send_once(const uint8_t *send_addr, const espnow_data_t *data_t
         ESP_LOGE(TAG, "Data to send is NULL");
         return ESP_ERR_INVALID_ARG;
     }
-    
-    // Send the data
-    esp_err_t result = esp_now_send((const uint8_t *)send_addr, (const uint8_t *)data_to_send, sizeof(espnow_data_t));
-    
-    if (result != ESP_OK) {
-        ESP_LOGE(TAG, "ESP-NOW single send error: %s", esp_err_to_name(result));
+
+    if (!esp_now_is_peer_exist(send_addr)) {
+        esp_now_peer_info_t peer = {};
+        peer.channel = ESPNOW_CHANNEL;
+        peer.ifidx   = ESPNOW_WIFI_IF;
+        peer.encrypt = false;
+        memcpy(peer.peer_addr, send_addr, ESP_NOW_ETH_ALEN);
+        esp_err_t add_ret = esp_now_add_peer(&peer);
+        if (add_ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to add peer "MACSTR": %s", MAC2STR(send_addr), esp_err_to_name(add_ret));
+            return add_ret;
+        }
+        ESP_LOGI(TAG, "Peer "MACSTR" added on-demand", MAC2STR(send_addr));
     }
-    
-    return result;
+
+    uint16_t stale;
+    while (xQueueReceive(espnow_ok_queue, &stale, 0) == pdTRUE) { /* discard */ }
+
+    int attempt = 0;
+    while (1) {
+        attempt++;
+        esp_err_t result = esp_now_send(send_addr, (const uint8_t *)data_to_send, sizeof(espnow_data_t));
+        if (result != ESP_OK) {
+            ESP_LOGE(TAG, "esp_now_send error on attempt %d: %s", attempt, esp_err_to_name(result));
+        } else {
+            ESP_LOGI(TAG, "Sent seq %u (attempt %d), waiting for OK...", data_to_send->seq_num, attempt);
+        }
+
+        uint16_t ok_seq = 0;
+        if (xQueueReceive(espnow_ok_queue, &ok_seq, pdMS_TO_TICKS(500)) == pdTRUE) {
+            if (ok_seq == data_to_send->seq_num) {
+                ESP_LOGI(TAG, "OK received for seq %u after %d attempt(s)", ok_seq, attempt);
+                return ESP_OK;
+            }
+            // Stale OK from a different seq, discard and keep trying
+            ESP_LOGW(TAG, "OK seq mismatch: got %u, expected %u", ok_seq, data_to_send->seq_num);
+        }
+    }
 }
 
 static void espnow_send_ack_task(void *pvParameters) {
@@ -135,16 +165,18 @@ static void espnow_send_ack_task(void *pvParameters) {
     }
 
     while (1) {
+        memset(packet, 0, sizeof(espnow_data_t));
         int payload_len = snprintf((char*)packet->data, sizeof(packet->data), "ACK; Seq Num: %lu", message_count);
-        packet->len = payload_len;
+        packet->len = (uint8_t)payload_len;
         packet->type = ACK;
-        packet->seq_num = message_count++;
+        packet->seq_num = (uint16_t)(message_count++);
         packet->crc = 0;
-        size_t total_size = sizeof(espnow_data_t) - sizeof(packet->data) + packet->len;
-        packet->crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)packet, total_size);
+        packet->crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)packet, sizeof(espnow_data_t));
 
-        if (esp_now_send(s_broadcast_mac, (uint8_t *)packet, total_size) != ESP_OK) {
-            ESP_LOGE(TAG, "ESP-NOW send error");
+        if (esp_now_send(s_broadcast_mac, (uint8_t *)packet, sizeof(espnow_data_t)) != ESP_OK) {
+            ESP_LOGE(TAG, "ESP-NOW ACK broadcast send error");
+        } else {
+            ESP_LOGI(TAG, "Broadcast ACK #%lu sent", message_count - 1);
         }
 
         vTaskDelay(pdMS_TO_TICKS(10000));
@@ -167,7 +199,6 @@ static void identify() {
 
 static void espnow_recv_task(void *pvParameters) {
     espnow_event_t evt;
-    int recv_seq = 0;
 
     while(1) {
         if (xQueueReceive(espnow_recv_queue, &evt, portMAX_DELAY) == pdTRUE) {
@@ -175,33 +206,14 @@ static void espnow_recv_task(void *pvParameters) {
             espnow_data_t *packet = (espnow_data_t *)evt.info.recv_cb.data;
             if (packet->type == ACK) {
                 ESP_LOGI(TAG, "Received ACK from: "MACSTR"", MAC2STR(recv_cb->mac_addr));
-
-                if (esp_now_is_peer_exist(recv_cb->mac_addr) == false) {
-                    esp_now_peer_info_t *peer = malloc(sizeof(esp_now_peer_info_t));
-                    if (peer == NULL) {
-                        ESP_LOGE(TAG, "Malloc peer information fail");
-                        esp_now_deinit();
-                        vTaskDelete(NULL);
-                    }
-                    memset(peer, 0, sizeof(esp_now_peer_info_t));
-                    peer->channel = ESPNOW_CHANNEL;
-                    peer->ifidx = ESPNOW_WIFI_IF;
-                    peer->encrypt = false;
-                    memcpy(peer->peer_addr, recv_cb->mac_addr, ESP_NOW_ETH_ALEN);
-                    ESP_ERROR_CHECK( esp_now_add_peer(peer) );
-                    free(peer);
-                } 
-                // Change receiver mac addr
-                memcpy(receiver_mac_addr, recv_cb->mac_addr, ESP_NOW_ETH_ALEN);
             } else if (packet->type == REQUEST) {
-                ESP_LOGI(TAG, "Receive %dth send f}rom: "MACSTR", len: %d", recv_seq, MAC2STR(recv_cb->mac_addr), recv_cb->data_len);
-                // for (size_t i = 0; i < recv_cb->data_len-4; i++) {
-                //     if (isprint(recv_cb->data[i])) {
-                //         printf("%c", recv_cb->data[i]);
-                //     }
-                // }
-                printf("Received Message:  %.*s\n", packet->len, (char*)packet->data);
-                recv_seq++;
+                ESP_LOGW(TAG, "Received unexpected REQUEST from: "MACSTR" — ignoring", MAC2STR(recv_cb->mac_addr));
+            } else if (packet->type == OK) {
+                uint16_t ok_seq = packet->seq_num;
+                ESP_LOGI(TAG, "Received OK for seq %u from "MACSTR"", ok_seq, MAC2STR(recv_cb->mac_addr));
+                if (xQueueSend(espnow_ok_queue, &ok_seq, 0) != pdTRUE) {
+                    ESP_LOGW(TAG, "ok_queue full — dropping OK for seq %u", ok_seq);
+                }
             } else if (packet->type == PING) {
                 espnow_data_t response;
                 response.type = PING;
@@ -213,8 +225,8 @@ static void espnow_recv_task(void *pvParameters) {
                 identify();
             } else {
                 ESP_LOGE(TAG, "INCORRECT PACKET TYPE DETECTED: %d", packet->type);
-                esp_now_deinit();
-                vTaskDelete(NULL);
+                // esp_now_deinit();
+                // vTaskDelete(NULL);
             }
             if (recv_cb->data) {
                 free(recv_cb->data);
@@ -263,6 +275,7 @@ void espnow_init(const gpio_num_t blink) {
 
     memcpy(send_param->dest_mac, s_broadcast_mac, ESP_NOW_ETH_ALEN);
     espnow_recv_queue = xQueueCreate(10, sizeof(espnow_event_t));
+    espnow_ok_queue   = xQueueCreate(4,  sizeof(uint16_t));
 
     xTaskCreate(espnow_recv_task, "espnow_recv_task", 4096, NULL, 4, NULL);
     if (strcmp(ROLE, "RECEIVER") == 0) {
