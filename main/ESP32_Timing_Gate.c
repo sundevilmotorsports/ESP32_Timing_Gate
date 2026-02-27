@@ -417,7 +417,7 @@ void app_main(void) {
             packet.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *) &packet, sizeof(espnow_data_t));
 
             ESP_LOGI(TAG, "Sending message #%d | timestamp: %lld us | diff: %lld us", counter, current_us, diff_us);
-            espnow_send_once(receiver_mac_addr, &packet);
+            espnow_enqueue_send(receiver_mac_addr, &packet);
 
             counter++;
             vTaskDelay(pdMS_TO_TICKS(1000));
@@ -454,7 +454,7 @@ void app_main(void) {
 
         ESP_LOGI(TAG, "Sending message #%d | timestamp: %lld us | diff: %lld us", counter, current_us, diff_us);
 
-        espnow_send_once(receiver_mac_addr, &packet);
+        espnow_enqueue_send(receiver_mac_addr, &packet);
         counter++;
     }
 #endif

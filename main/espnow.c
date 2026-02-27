@@ -8,6 +8,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include <string.h>
 #include "espnow.h"
 #include <stdio.h>
@@ -21,12 +22,12 @@
 #define ESPNOW_WIFI_IF      ESP_IF_WIFI_STA
 #define ESPNOW_CHANNEL      1
 #define ESPNOW_LMK          NULL
-#define ACK_SEND_DELAY      CONFIG_ACK_SEND_DELAY
 #define PAYLOAD_BUFFER_SIZE 50  // Max size of the data payload
 
-#define SEND_QUEUE_SIZE     CONFIG_SEND_QUEUE_SIZE
-#define RECV_QUEUE_SIZE     CONFIG_RECV_QUEUE_SIZE
+#define SEND_QUEUE_SIZE     10
+#define RECV_QUEUE_SIZE     10
 #define MAX_QUEUE_DELAY 512
+#define MAX_SEND_RETRIES 100
 
 gpio_num_t led;
 
@@ -42,9 +43,15 @@ gpio_num_t led;
     static const char *TAG = "ESPNOW_RECEIVER";
 #endif
 
+typedef struct {
+    uint8_t         dest_mac[ESP_NOW_ETH_ALEN];
+    espnow_data_t   packet;
+} espnow_send_item_t;
+
 static QueueHandle_t espnow_send_queue = NULL;
 static QueueHandle_t espnow_recv_queue = NULL;
-static QueueHandle_t espnow_ok_queue   = NULL;   // OK confirmations from receiver
+static QueueHandle_t espnow_ok_queue   = NULL;
+static SemaphoreHandle_t espnow_send_mutex = NULL;
 
 // Broadcast + Receiver MAC Address
 uint8_t s_broadcast_mac[ESP_NOW_ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
@@ -116,6 +123,11 @@ esp_err_t espnow_send_once(const uint8_t *send_addr, const espnow_data_t *data_t
         return ESP_ERR_INVALID_ARG;
     }
 
+    if (xSemaphoreTake(espnow_send_mutex, portMAX_DELAY) != pdTRUE) {
+        ESP_LOGE(TAG, "Failed to acquire send mutex");
+        return ESP_FAIL;
+    }
+
     if (!esp_now_is_peer_exist(send_addr)) {
         esp_now_peer_info_t peer = {};
         peer.channel = ESPNOW_CHANNEL;
@@ -125,18 +137,18 @@ esp_err_t espnow_send_once(const uint8_t *send_addr, const espnow_data_t *data_t
         esp_err_t add_ret = esp_now_add_peer(&peer);
         if (add_ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to add peer "MACSTR": %s", MAC2STR(send_addr), esp_err_to_name(add_ret));
+            xSemaphoreGive(espnow_send_mutex);
             return add_ret;
         }
         ESP_LOGI(TAG, "Peer "MACSTR" added on-demand", MAC2STR(send_addr));
     }
 
     uint16_t stale;
-    while (xQueueReceive(espnow_ok_queue, &stale, 0) == pdTRUE) { /* discard */ }
+    while (xQueueReceive(espnow_ok_queue, &stale, 0) == pdTRUE) { /* discard stale OKs */ }
 
-    int attempt = 0;
-    while (1) {
-        attempt++;
-        esp_err_t result = esp_now_send(send_addr, (const uint8_t *)data_to_send, sizeof(espnow_data_t));
+    esp_err_t result = ESP_FAIL;
+    for (int attempt = 1; attempt <= MAX_SEND_RETRIES; attempt++) {
+        result = esp_now_send(send_addr, (const uint8_t *)data_to_send, sizeof(espnow_data_t));
         if (result != ESP_OK) {
             ESP_LOGE(TAG, "esp_now_send error on attempt %d: %s", attempt, esp_err_to_name(result));
         } else {
@@ -147,10 +159,48 @@ esp_err_t espnow_send_once(const uint8_t *send_addr, const espnow_data_t *data_t
         if (xQueueReceive(espnow_ok_queue, &ok_seq, pdMS_TO_TICKS(500)) == pdTRUE) {
             if (ok_seq == data_to_send->seq_num) {
                 ESP_LOGI(TAG, "OK received for seq %u after %d attempt(s)", ok_seq, attempt);
+                xSemaphoreGive(espnow_send_mutex);
                 return ESP_OK;
             }
-            // Stale OK from a different seq, discard and keep trying
+            // Stale OK from a different seq, discard and retry
             ESP_LOGW(TAG, "OK seq mismatch: got %u, expected %u", ok_seq, data_to_send->seq_num);
+        } else {
+            ESP_LOGW(TAG, "Timeout waiting for OK (seq %u, attempt %d/%d)",
+                     data_to_send->seq_num, attempt, MAX_SEND_RETRIES);
+        }
+    }
+
+    ESP_LOGE(TAG, "Failed to get OK for seq %u after %d attempts", data_to_send->seq_num, MAX_SEND_RETRIES);
+    xSemaphoreGive(espnow_send_mutex);
+    return ESP_FAIL;
+}
+
+esp_err_t espnow_enqueue_send(const uint8_t *dest_mac, const espnow_data_t *data) {
+    if (dest_mac == NULL || data == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    espnow_send_item_t item;
+    memcpy(item.dest_mac, dest_mac, ESP_NOW_ETH_ALEN);
+    item.packet = *data;   // full copy so the caller's stack frame can go away
+    if (xQueueSend(espnow_send_queue, &item, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "Send queue full — dropping seq %u", data->seq_num);
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "Enqueued seq %u (queue depth: %u/%u)",
+             data->seq_num,
+             (unsigned)uxQueueMessagesWaiting(espnow_send_queue),
+             SEND_QUEUE_SIZE);
+    return ESP_OK;
+}
+
+static void espnow_send_task(void *pvParameters) {
+    espnow_send_item_t item;
+    while (1) {
+        if (xQueueReceive(espnow_send_queue, &item, portMAX_DELAY) == pdTRUE) {
+            esp_err_t ret = espnow_send_once(item.dest_mac, &item.packet);
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "espnow_send_task: seq %u failed", item.packet.seq_num);
+            }
         }
     }
 }
@@ -242,9 +292,7 @@ void espnow_init(const gpio_num_t blink) {
     ESP_ERROR_CHECK(esp_now_register_send_cb(espnow_send_cb));
     ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
 
-    #if CONFIG_ESPNOW_ENABLE_LONG_RANGE
-        ESP_ERROR_CHECK( esp_wifi_set_protocol(ESPNOW_WIFI_IF, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N|WIFI_PROTOCOL_LR) );
-    #endif
+    ESP_ERROR_CHECK( esp_wifi_set_protocol(ESPNOW_WIFI_IF, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N|WIFI_PROTOCOL_LR) );
 
     led = blink;
 
@@ -274,9 +322,12 @@ void espnow_init(const gpio_num_t blink) {
     }
 
     memcpy(send_param->dest_mac, s_broadcast_mac, ESP_NOW_ETH_ALEN);
-    espnow_recv_queue = xQueueCreate(10, sizeof(espnow_event_t));
+    espnow_send_queue = xQueueCreate(SEND_QUEUE_SIZE, sizeof(espnow_send_item_t));
+    espnow_recv_queue = xQueueCreate(RECV_QUEUE_SIZE, sizeof(espnow_event_t));
     espnow_ok_queue   = xQueueCreate(4,  sizeof(uint16_t));
+    espnow_send_mutex = xSemaphoreCreateMutex();
 
+    xTaskCreate(espnow_send_task, "espnow_send_task", 4096, NULL, 5, NULL);
     xTaskCreate(espnow_recv_task, "espnow_recv_task", 4096, NULL, 4, NULL);
     if (strcmp(ROLE, "RECEIVER") == 0) {
         xTaskCreate(espnow_send_ack_task, "espnow_send_ack_task", 4096, NULL, 4, NULL);

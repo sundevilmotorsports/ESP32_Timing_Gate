@@ -69,5 +69,6 @@ void espnow_init(const gpio_num_t blink);
 void espnow_deinit(espnow_send_param_t *send_param);
 void wifi_init(void);
 esp_err_t espnow_send_once(const uint8_t *send_addr, const espnow_data_t *data_to_send);
+esp_err_t espnow_enqueue_send(const uint8_t *dest_mac, const espnow_data_t *data);
 
 #endif
