@@ -23,12 +23,11 @@ static const char *TAG = "MAIN";
 #define I2C_MASTER_TIMEOUT_MS       10000
 #define TF_ADDR                     0x10
 #define RTC_ADDR                    0b1101000
-#define THRESHOLD 50
 
 #define RTC_REG_SECONDS 0x00
 
 #define DEBOUNCE_TIME 5
-#define DETECT 50
+#define DETECT 300
 
 #define UART_PORT UART_NUM_0
 #define UART_BUF_SIZE 1024
