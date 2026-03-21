@@ -27,7 +27,7 @@ static const char *TAG = "MAIN";
 #define RTC_REG_SECONDS 0x00
 
 #define DEBOUNCE_TIME 5
-#define DETECT 300
+#define DETECT 100
 
 #define UART_PORT UART_NUM_0
 #define UART_BUF_SIZE 1024
@@ -41,7 +41,7 @@ static long change_time = 0;
 static long last_activation = 0;
 
 static volatile int64_t last_sync_us = 0; // Last sync timestamp (µs)
-static volatile int64_t rtc_seconds = 0; // DS3231 absolute time in seconds
+static volatile int64_t rtc_seconds = 0;  // DS3231 absolute time in seconds
 
 static QueueHandle_t uart_event_queue = NULL;
 
@@ -68,9 +68,8 @@ int debounce(int input) {
 i2c_master_dev_handle_t tfmini_dev_handle;
 i2c_master_bus_handle_t bus_handle;
 
-// Function Declarations
 uint16_t getTfData() {
-    uint8_t getData[] = {0x5A, 0x05, 0x00, 0x01, 0x60}; // Send command to device
+    uint8_t getData[] = {0x5A, 0x05, 0x00, 0x01, 0x60};
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
     i2c_master_write_byte(cmd, (TF_ADDR << 1) | I2C_MASTER_WRITE, true);
@@ -81,7 +80,6 @@ uint16_t getTfData() {
     esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 1000 / portTICK_PERIOD_MS);
     i2c_cmd_link_delete(cmd);
     if (ret == ESP_OK) {
-        // Read 9 bytes response from device
         uint8_t read_data[9];
         cmd = i2c_cmd_link_create();
         i2c_master_start(cmd);
@@ -89,14 +87,11 @@ uint16_t getTfData() {
         for (int i = 0; i < 8; i++) {
             i2c_master_read_byte(cmd, &read_data[i], I2C_MASTER_ACK);
         }
-        i2c_master_read_byte(cmd, &read_data[8], I2C_MASTER_NACK); // Last byte with NACK
+        i2c_master_read_byte(cmd, &read_data[8], I2C_MASTER_NACK);
         i2c_master_stop(cmd);
         ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 1000 / portTICK_PERIOD_MS);
         i2c_cmd_link_delete(cmd);
         if (ret == ESP_OK) {
-            //  && (read_data[3] << 8 | read_data[2]) < 500
-            // ESP_LOGI("I2C", "LiDAR Response:");
-            // printf("Distance %u cm\n", read_data[3] << 8 | read_data[2]);
             return read_data[3] << 8 | read_data[2];
         } else {
             ESP_LOGE("I2C", "Failed to read response");
@@ -110,7 +105,7 @@ uint16_t getTfData() {
     return 0;
 }
 
-// --- Helper: Read BCD from DS3231 ---
+// --- Helper: BCD conversion ---
 static uint8_t bcd2dec(uint8_t val) {
     return (val >> 4) * 10 + (val & 0x0F);
 }
@@ -119,7 +114,7 @@ static uint8_t dec2bcd(uint8_t val) {
     return ((val / 10) << 4) + (val % 10);
 }
 
-// --- Read seconds from DS3231 ---
+// --- Read time from DS3231 ---
 static esp_err_t ds3231_get_time(uint8_t *hours, uint8_t *minutes, uint8_t *seconds) {
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
@@ -140,7 +135,7 @@ static esp_err_t ds3231_get_time(uint8_t *hours, uint8_t *minutes, uint8_t *seco
 
     *seconds = bcd2dec(data[0]);
     *minutes = bcd2dec(data[1]);
-    *hours = bcd2dec(data[2] & 0x3F);
+    *hours   = bcd2dec(data[2] & 0x3F);
 
     return ESP_OK;
 }
@@ -149,7 +144,7 @@ static volatile int64_t sqw_edge_us = 0;
 static TaskHandle_t rtc_sync_task_handle = NULL;
 static portMUX_TYPE rtc_sync_mux = portMUX_INITIALIZER_UNLOCKED;
 
-// --- Interrupt Handler on 1 Hz SQW rising edge ---
+// --- Interrupt handler: captures exact edge time ---
 static void IRAM_ATTR sqw_handler(void *arg) {
     sqw_edge_us = esp_timer_get_time();
     BaseType_t higher_priority_task_woken = pdFALSE;
@@ -157,7 +152,7 @@ static void IRAM_ATTR sqw_handler(void *arg) {
     portYIELD_FROM_ISR(higher_priority_task_woken);
 }
 
-// --- Task that does the I2C read after the SQW edge ---
+// --- Task: reads I2C after SQW edge and latches the anchor ---
 static void rtc_sync_task(void *arg) {
     while (1) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
@@ -174,39 +169,25 @@ static void rtc_sync_task(void *arg) {
     }
 }
 
-// --- Get synced microseconds ---
+// --- Get wall-clock microseconds, anchored to the last SQW edge ---
 int64_t get_synced_micros(void) {
     portENTER_CRITICAL(&rtc_sync_mux);
     int64_t base_rtc_seconds = rtc_seconds;
     int64_t last_sync = last_sync_us;
     portEXIT_CRITICAL(&rtc_sync_mux);
 
-    if (last_sync == 0) {
-        ESP_LOGW(TAG, "RTC not synced, returning raw timer value");
-        return esp_timer_get_time();
-    }
-
     int64_t now_us = esp_timer_get_time();
     int64_t delta_us = now_us - last_sync;
     return base_rtc_seconds * 1000000LL + delta_us;
 }
 
-// // --- Get synced microseconds ---
-// int64_t get_synced_micros(void) {
-//     int64_t now_us = esp_timer_get_time();
-//     int64_t delta_us = now_us - last_sync_us;
-//     return rtc_seconds * 1000000 + delta_us;
-// }
-
+// --- Set DS3231 time ---
 esp_err_t ds3231_set_time(struct tm *time) {
     uint8_t data[7];
 
     data[0] = dec2bcd(time->tm_sec);
     data[1] = dec2bcd(time->tm_min);
     data[2] = dec2bcd(time->tm_hour);
-
-    /* The week data must be in the range 1 to 7, and to keep the start on the
-     * same day as for tm_wday have it start at 1 on Sunday. */
     data[3] = dec2bcd(time->tm_wday + 1);
     data[4] = dec2bcd(time->tm_mday);
     data[5] = dec2bcd(time->tm_mon + 1);
@@ -222,6 +203,19 @@ esp_err_t ds3231_set_time(struct tm *time) {
     esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 1000 / portTICK_PERIOD_MS);
     i2c_cmd_link_delete(cmd);
 
+    return ret;
+}
+
+// --- Enable 1 Hz square wave output on DS3231 SQW pin ---
+static esp_err_t ds3231_enable_sqw(void) {
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (RTC_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, 0x0E, true);  // Control register
+    i2c_master_write_byte(cmd, 0x00, true);  // 1 Hz SQW, INTCN=0
+    i2c_master_stop(cmd);
+    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 1000 / portTICK_PERIOD_MS);
+    i2c_cmd_link_delete(cmd);
     return ret;
 }
 
@@ -266,7 +260,6 @@ void app_main(void) {
 #if USE_REAL_DATA
     ESP_LOGI(TAG, "Using real data");
 
-    uint8_t buf[7];
     i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
         .sda_io_num = I2C_MASTER_SDA_IO,
@@ -279,11 +272,17 @@ void app_main(void) {
     i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
     vTaskDelay(1000 / portTICK_PERIOD_MS);
 
+    if (ds3231_enable_sqw() == ESP_OK) {
+        ESP_LOGI(TAG, "DS3231 SQW enabled");
+    } else {
+        ESP_LOGE(TAG, "Failed to enable DS3231 SQW");
+    }
+
     uart_init();
 
     vTaskDelay(1000 / portTICK_PERIOD_MS);
 
-    ESP_LOGI(TAG, "Waiting for rtc sync");
+    ESP_LOGI(TAG, "Waiting for RTC time sync over UART");
 
     uint8_t data[128];
     int total_len = 0;
@@ -301,38 +300,36 @@ void app_main(void) {
         }
 
         if (esp_timer_get_time() - start_time > timeout_us) {
-            ESP_LOGI(TAG, "No timestamp received");
+            ESP_LOGI(TAG, "No timestamp received — using existing DS3231 time");
             break;
         }
     }
 
     if (total_len > 0) {
         data[total_len] = '\0';
-        // printf("Received: %.*s\n", total_len, data);
 
         if (total_len >= 6) {
             char hour_str[3] = {data[0], data[1], '\0'};
-            char min_str[3] = {data[2], data[3], '\0'};
-            char sec_str[3] = {data[4], data[5], '\0'};
+            char min_str[3]  = {data[2], data[3], '\0'};
+            char sec_str[3]  = {data[4], data[5], '\0'};
 
-            int hours = atoi(hour_str);
+            int hours   = atoi(hour_str);
             int minutes = atoi(min_str);
             int seconds = atoi(sec_str);
 
             if (hours >= 0 && hours <= 23 && minutes >= 0 && minutes <= 59 && seconds >= 0 && seconds <= 59) {
                 struct tm time;
                 time.tm_hour = hours;
-                time.tm_min = minutes;
-                time.tm_sec = seconds;
-                // Not needed
+                time.tm_min  = minutes;
+                time.tm_sec  = seconds;
                 time.tm_wday = 0;
                 time.tm_mday = 0;
-                time.tm_mon = 0;
+                time.tm_mon  = 0;
                 time.tm_year = 125;
 
                 esp_err_t ret = ds3231_set_time(&time);
                 if (ret == ESP_OK) {
-                    ESP_LOGI(TAG, "Time set successfully to %02d:%02d:%02d", hours, minutes, seconds);
+                    ESP_LOGI(TAG, "Time set to %02d:%02d:%02d", hours, minutes, seconds);
                     for (size_t i = 1; i < 11; i++) {
                         gpio_set_level(LED_PIN, i % 2);
                         vTaskDelay(pdMS_TO_TICKS(200));
@@ -346,62 +343,50 @@ void app_main(void) {
         } else {
             ESP_LOGE(TAG, "Invalid timestamp format. Expected HHMMSS, got %d characters", total_len);
         }
-    } else {
-        ESP_LOGI(TAG, "No timestamp received");
     }
 
     uart_driver_delete(UART_NUM_0);
 
     uint16_t dist = 0;
-    uint16_t prevDist = 0; // Send command to device
+    uint16_t prevDist = 0;
     espnow_data_t packet;
 
     int counter = 0;
     bool currentState = false;
     bool prev = false;
     int64_t epoch_us = 0;
-    int64_t diff_us = 0;
 
-    // Seed RTC time immediately on boot
-    {
-        uint8_t h, m, s;
-        if (ds3231_get_time(&h, &m, &s) == ESP_OK) {
-            portENTER_CRITICAL(&rtc_sync_mux);
-            rtc_seconds = (int64_t)h * 3600 + m * 60 + s;
-            last_sync_us = esp_timer_get_time();
-            portEXIT_CRITICAL(&rtc_sync_mux);
-            ESP_LOGI(TAG, "RTC boot seed: %02d:%02d:%02d", h, m, s);
-        } else {
-            ESP_LOGE(TAG, "RTC boot seed failed — timestamps will be time-since-boot until first SQW edge");
-        }
-    }
-
-    // SQW input pin
     gpio_config_t io_conf = {
-        .intr_type = GPIO_INTR_POSEDGE,
-        .mode = GPIO_MODE_INPUT,
+        .intr_type    = GPIO_INTR_POSEDGE,
+        .mode         = GPIO_MODE_INPUT,
         .pin_bit_mask = 1ULL << SQW_GPIO,
-        .pull_up_en = 1,
+        .pull_up_en   = 1,
     };
     gpio_config(&io_conf);
     xTaskCreate(rtc_sync_task, "rtc_sync", 4096, NULL, 10, &rtc_sync_task_handle);
     gpio_install_isr_service(0);
     gpio_isr_handler_add(SQW_GPIO, sqw_handler, NULL);
 
-    // 90 Hz loop timing (11.11 ms period)
-    const TickType_t loop_period = pdMS_TO_TICKS(11); // ~11.11 ms for 90 Hz
+    // Block until the first SQW edge has fired (at most ~1 second wait).
+    ESP_LOGI(TAG, "Waiting for first SQW edge to anchor RTC...");
+    while (1) {
+        portENTER_CRITICAL(&rtc_sync_mux);
+        int64_t sync = last_sync_us;
+        portEXIT_CRITICAL(&rtc_sync_mux);
+        if (sync != 0) break;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    ESP_LOGI(TAG, "RTC anchored — starting detection loop");
+
+    // 90 Hz loop timing (~11.11 ms period)
+    const TickType_t loop_period = pdMS_TO_TICKS(11);
     TickType_t last_wake_time = xTaskGetTickCount();
 
     while (1) {
         prevDist = dist;
         dist = getTfData();
-        // currentState = (abs(dist - prevDist) > THRESHOLD) ? 1 : 0;
-        // if (currentState) {
-        //     detect = !detect;
-        // }
         prev = currentState;
         currentState = debounce(dist < DETECT);
-        // printf("Time Delta: %f\n", (float)(get_synced_micros() / 1e6) - (float)(esp_timer_get_time() / 1e6));
 
         if (!prev && currentState) {
             packet.seq_num = counter;
@@ -410,10 +395,10 @@ void app_main(void) {
             epoch_us = current_us;
 
             int data_len = snprintf((char*)packet.data, sizeof(packet.data), "%lld,%lld", current_us, diff_us);
-            packet.len = data_len;
+            packet.len  = data_len;
             packet.type = REQUEST;
-            packet.crc = 0;
-            packet.crc = esp_crc16_le(UINT16_MAX, (uint8_t const *) &packet, sizeof(espnow_data_t));
+            packet.crc  = 0;
+            packet.crc  = esp_crc16_le(UINT16_MAX, (uint8_t const *)&packet, sizeof(espnow_data_t));
 
             ESP_LOGI(TAG, "Sending message #%d | timestamp: %lld us | diff: %lld us", counter, current_us, diff_us);
             espnow_enqueue_send(receiver_mac_addr, &packet);
@@ -422,7 +407,6 @@ void app_main(void) {
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
 
-        // Maintain 90 Hz loop rate
         vTaskDelayUntil(&last_wake_time, loop_period);
     }
 
@@ -432,12 +416,9 @@ void app_main(void) {
     espnow_data_t packet;
 
     int counter = 0;
-    bool currentState = false;
-    bool prev = false;
     int64_t epoch_us = 0;
-    int64_t diff_us = 0;
 
-    while(1) {
+    while (1) {
         vTaskDelay(pdMS_TO_TICKS(rand() % (5000 + 1)));
 
         int64_t current_us = esp_timer_get_time();

@@ -51,17 +51,19 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    printf("Waiting for next second boundary\n");
+    printf("Waiting to write next second 50ms before boundary\n");
 
     struct timeval tv;
     gettimeofday(&tv, NULL);
 
-    int usec_to_wait = 1000000 - tv.tv_usec;
+    int usec_to_wait = (1000000 - tv.tv_usec) - 50000;
+    if (usec_to_wait < 0) usec_to_wait += 1000000;
     usleep(usec_to_wait);
 
     time_t rawtime;
     struct tm *timeinfo;
     time(&rawtime);
+    rawtime += 1; // write the upcoming second
     timeinfo = localtime(&rawtime);
 
     char time_str[8];
@@ -75,7 +77,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    printf("Sent: %s (%02d:%02d:%02d) to %s at second boundary\n",
+    printf("Sent: %s (%02d:%02d:%02d) to %s — DS3231 will tick to this at next boundary\n",
            time_str, timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec, argv[1]);
 
     close(serial_fd);
