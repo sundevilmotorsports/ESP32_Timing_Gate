@@ -42,6 +42,9 @@ typedef enum {
     PING,
     IDENT,
     OK,
+    TELEMETRY,
+    SET_LOGGER_NAME,
+    GATE_STUCK,
 } espnow_msg_type_t;
 
 typedef enum {

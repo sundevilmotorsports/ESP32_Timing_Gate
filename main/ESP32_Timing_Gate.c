@@ -27,7 +27,7 @@ static const char *TAG = "MAIN";
 #define RTC_REG_SECONDS 0x00
 
 #define DEBOUNCE_TIME 5
-#define DETECT 500
+#define DETECT 50
 
 #define UART_PORT UART_NUM_0
 #define UART_BUF_SIZE 1024
@@ -355,6 +355,8 @@ void app_main(void) {
     bool currentState = false;
     bool prev = false;
     int64_t epoch_us = 0;
+    bool stuck_sent = false;
+    int64_t clear_start_us = 0;   // when sensor first read clear after being stuck
 
     gpio_config_t io_conf = {
         .intr_type    = GPIO_INTR_POSEDGE,
@@ -405,6 +407,56 @@ void app_main(void) {
 
             counter++;
             vTaskDelay(pdMS_TO_TICKS(1000));
+
+            // Confirm stuck: sensor must read blocked on 3 consecutive reads spaced
+            // 50ms apart. Uses esp_timer_get_time() (µs) to avoid the 10ms clock
+            // resolution issue with get_time_ms()/debounce().
+            int stuck_votes = 0;
+            for (int i = 0; i < 3; i++) {
+                uint16_t d = getTfData();
+                if (d > 0 && d < DETECT) stuck_votes++;
+                if (i < 2) vTaskDelay(pdMS_TO_TICKS(50));
+            }
+
+            if (stuck_votes == 3 && !stuck_sent) {
+                espnow_data_t stuck_pkt;
+                stuck_pkt.seq_num = counter++;
+                stuck_pkt.type    = GATE_STUCK;
+                stuck_pkt.data[0] = 1;
+                stuck_pkt.len     = 1;
+                stuck_pkt.crc     = 0;
+                stuck_pkt.crc     = esp_crc16_le(UINT16_MAX, (uint8_t const *)&stuck_pkt, sizeof(espnow_data_t));
+                ESP_LOGW(TAG, "Gate stuck (votes=%d) — sending GATE_STUCK", stuck_votes);
+                espnow_enqueue_send(receiver_mac_addr, &stuck_pkt);
+                stuck_sent = true;
+                clear_start_us = 0;
+            } else {
+                stuck_sent = false;
+            }
+        }
+
+        // Clearing: sensor must read unblocked for 200ms continuously before sending clear.
+        // Filters out brief noise spikes that would falsely un-stuck the gate.
+        if (stuck_sent) {
+            uint16_t clear_check = getTfData();
+            if (clear_check >= DETECT) {
+                if (clear_start_us == 0) clear_start_us = esp_timer_get_time();
+                if (esp_timer_get_time() - clear_start_us >= 200000LL) {
+                    espnow_data_t clear_pkt;
+                    clear_pkt.seq_num = counter++;
+                    clear_pkt.type    = GATE_STUCK;
+                    clear_pkt.data[0] = 0;
+                    clear_pkt.len     = 1;
+                    clear_pkt.crc     = 0;
+                    clear_pkt.crc     = esp_crc16_le(UINT16_MAX, (uint8_t const *)&clear_pkt, sizeof(espnow_data_t));
+                    ESP_LOGI(TAG, "Gate cleared (dist=%d) — sending GATE_STUCK clear", clear_check);
+                    espnow_enqueue_send(receiver_mac_addr, &clear_pkt);
+                    stuck_sent = false;
+                    clear_start_us = 0;
+                }
+            } else {
+                clear_start_us = 0;  // blocked again, reset the clear timer
+            }
         }
 
         vTaskDelayUntil(&last_wake_time, loop_period);
