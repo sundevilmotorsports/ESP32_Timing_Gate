@@ -27,7 +27,7 @@ static const char *TAG = "MAIN";
 #define RTC_REG_SECONDS 0x00
 
 #define DEBOUNCE_TIME 5
-#define DETECT 50
+#define DETECT 500
 
 #define UART_PORT UART_NUM_0
 #define UART_BUF_SIZE 1024
