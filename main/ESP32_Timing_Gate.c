@@ -380,8 +380,7 @@ void app_main(void) {
     }
     ESP_LOGI(TAG, "RTC anchored — starting detection loop");
 
-    // 90 Hz loop timing (~11.11 ms period)
-    const TickType_t loop_period = pdMS_TO_TICKS(11);
+    const TickType_t loop_period = pdMS_TO_TICKS(1);
     TickType_t last_wake_time = xTaskGetTickCount();
 
     while (1) {
